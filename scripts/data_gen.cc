@@ -93,7 +93,6 @@ void writeFloat32VectorToFile(const std::vector<Vector>& vectors, const std::str
 
 int main(int argc, char* argv[]) {
   int M = 2000; 
-  int N = 1000;
   int dimensions = 200;
   int K = 100;
 
@@ -101,39 +100,28 @@ int main(int argc, char* argv[]) {
     M = std::atoi(argv[1]);
   }
 
-  if (argc > 2) {
-    N = std::atoi(argv[2]);
-  }
-
   std::cout << "Random gen with"
 	     << " M: " << M 
-	     << ", N: " << N
 	     << ", K: " << K
 	     << ", D: " << dimensions
 	     << std::endl;
 
-  Vector targetVector = genRandVec(dimensions); // 随机生成一个目标向量
   std::vector<Vector> randomVectors;
-  std::vector<Vector> targetVectors;
 
   for (int i = 0; i < M; i++) {
     randomVectors.push_back(genRandVec(dimensions));
   }
 
-  for (int i = 0; i < N; i++) {
-    targetVectors.push_back(genRandVec(dimensions));
-  }
-
   writeFloat32VectorToFile(randomVectors, "random_vectors.bin", true);
-  writeFloat32VectorToFile(targetVectors, "target_vectors.bin", true);
 
   std::cout << "Start Running..." << std::endl;
+  auto round_start = std::chrono::high_resolution_clock::now();
 
   auto start = std::chrono::high_resolution_clock::now();
 
   TopKQueue<IdDisPair> topk_que(K);
-  for (int n = 0; n < N; n++) {
-    auto target_vector = targetVectors[n];
+  for (int n = 0; n < M; n++) {
+    auto target_vector = randomVectors[n];
     for (int m = 0; m < M; m++) {
       topk_que.insert(IdDisPair(m, calcDis(randomVectors[m], target_vector)));
     }
@@ -143,10 +131,14 @@ int main(int argc, char* argv[]) {
     for (const auto & id_dis : knn_queue) {
       knn_vectors.push_back(randomVectors[id_dis.id]);
     }
-    writeFloat32VectorToFile(knn_vectors , "knn_vectors.bin", false);
+    writeFloat32VectorToFile(knn_vectors , "knn_graphs.bin", false);
 
     if (n % 10 == 0) {
-      std::cout << "Finished N: " << n << std::endl;
+      auto end = std::chrono::high_resolution_clock::now();
+      auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - round_start).count();
+      double qps = 10 * M * 1000 / duration;
+      std::cout << "N: " << n << ", qps: " << qps << std::endl;
+      round_start = std::chrono::high_resolution_clock::now();
     }
   }
 
