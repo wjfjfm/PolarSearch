@@ -6,13 +6,13 @@
 
 ```
 # Create Exp ENV
-reprozip trace ./myprogram
+reprozip trace ./data_gen
 
 # Create Pack
-reprozip pack myprogram.rpz
+reprozip pack data_gen.rpz
 
 # Run Pack
-reprozip unpack myprogram.rpz
+reprounzip docker setup data_gen.rpz data_gen.docker
 reprozip docker setup
 reprozip docker run
 
@@ -24,6 +24,16 @@ reprozip docker run
 cd scripts
 make
 ./data_gen 5000000 10
+```
+
+- Cache Line of CPU
+
+```
+root@iZbp1ajubcf4dil5d8ma6gZ:~# lscpu | grep "cache"
+L1d cache:                          512 KiB (16 instances)
+L1i cache:                          512 KiB (16 instances)
+L2 cache:                           16 MiB (16 instances)
+L3 cache:                           33 MiB (1 instance)
 ```
 
 ## TODO

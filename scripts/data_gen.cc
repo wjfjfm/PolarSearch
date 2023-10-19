@@ -62,33 +62,33 @@ double calcDis(const Vector& v1, const Vector& v2) {
 
 // 生成一个随机向量
 Vector genRandVec(int dimensions) {
-    Vector v;
-    for (int i = 0; i < dimensions; i++) {
-        float randomValue = static_cast<float>(rand()) / RAND_MAX;
-        v.elements.push_back(randomValue);
-    }
-    return std::move(v);
+  Vector v;
+  for (int i = 0; i < dimensions; i++) {
+    float randomValue = static_cast<float>(rand()) / RAND_MAX;
+    v.elements.push_back(randomValue);
+  }
+  return std::move(v);
 }
 
 void writeFloat32VectorToFile(const std::vector<Vector>& vectors, const std::string& filename, const bool with_num) {
-    std::ofstream file(filename, std::ios::binary | std::ios::app);
-    if (!file) {
-        std::cerr << "Error opening file " << filename << std::endl;
-        return;
-    }
+  std::ofstream file(filename, std::ios::binary | std::ios::app);
+  if (!file) {
+      std::cerr << "Error opening file " << filename << std::endl;
+      return;
+  }
 
-    if (with_num) {
-      uint32_t vec_num = vectors.size();
-      file.write(reinterpret_cast<const char*>(&vec_num), sizeof(uint32_t));
-    }
+  if (with_num) {
+    uint32_t vec_num = vectors.size();
+    file.write(reinterpret_cast<const char*>(&vec_num), sizeof(uint32_t));
+  }
 
-    for (const auto& vector : vectors) {
-        for (const auto& element : vector.elements) {
-            file.write(reinterpret_cast<const char*>(&element), sizeof(float));
-        }
+  for (const auto& vector : vectors) {
+    for (const auto& element : vector.elements) {
+        file.write(reinterpret_cast<const char*>(&element), sizeof(float));
     }
+  }
 
-    file.close();
+  file.close();
 }
 
 int main(int argc, char* argv[]) {
@@ -144,6 +144,10 @@ int main(int argc, char* argv[]) {
       knn_vectors.push_back(randomVectors[id_dis.id]);
     }
     writeFloat32VectorToFile(knn_vectors , "knn_vectors.bin", false);
+
+    if (n % 10 == 0) {
+      std::cout << "Finished N: " << n << std::endl;
+    }
   }
 
   auto end = std::chrono::high_resolution_clock::now();
