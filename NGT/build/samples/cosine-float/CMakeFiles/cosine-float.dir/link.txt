@@ -1,0 +1,1 @@
+/usr/bin/c++  -fopenmp -rdynamic CMakeFiles/cosine-float.dir/cosine-float.cpp.o -o cosine-float   -L/root/NGT/build/lib/NGT  -L/root/NGT/lib/NGT  ../../lib/NGT/libngt.so.2.1.3 -lpthread -llapack -lblas -lgomp -lrt 

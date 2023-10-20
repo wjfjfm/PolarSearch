@@ -1,0 +1,1 @@
+/usr/bin/c++  -fopenmp -rdynamic CMakeFiles/qbg-capi.dir/qbg-capi.cpp.o -o qbg-capi   -L/root/NGT/build/lib/NGT  -L/root/NGT/lib/NGT  ../../lib/NGT/libngt.so.2.1.3 -lpthread -llapack -lblas -lgomp -lrt 

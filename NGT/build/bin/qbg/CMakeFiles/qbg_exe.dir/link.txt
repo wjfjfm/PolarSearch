@@ -1,0 +1,1 @@
+/usr/bin/c++  -fopenmp -rdynamic CMakeFiles/qbg_exe.dir/qbg.cpp.o -o qbg   -L/root/NGT/build/lib/NGT  -L/root/NGT/lib/NGT  ../../lib/NGT/libngt.so.2.1.3 -lpthread -llapack -lblas -lgomp -lrt 

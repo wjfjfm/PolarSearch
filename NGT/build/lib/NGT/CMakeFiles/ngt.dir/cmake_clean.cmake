@@ -1,0 +1,43 @@
+file(REMOVE_RECURSE
+  "CMakeFiles/ngt.dir/ArrayFile.cpp.o"
+  "CMakeFiles/ngt.dir/ArrayFile.cpp.o.d"
+  "CMakeFiles/ngt.dir/Capi.cpp.o"
+  "CMakeFiles/ngt.dir/Capi.cpp.o.d"
+  "CMakeFiles/ngt.dir/Command.cpp.o"
+  "CMakeFiles/ngt.dir/Command.cpp.o.d"
+  "CMakeFiles/ngt.dir/Graph.cpp.o"
+  "CMakeFiles/ngt.dir/Graph.cpp.o.d"
+  "CMakeFiles/ngt.dir/Index.cpp.o"
+  "CMakeFiles/ngt.dir/Index.cpp.o.d"
+  "CMakeFiles/ngt.dir/MmapManager.cpp.o"
+  "CMakeFiles/ngt.dir/MmapManager.cpp.o.d"
+  "CMakeFiles/ngt.dir/NGTQ/Capi.cpp.o"
+  "CMakeFiles/ngt.dir/NGTQ/Capi.cpp.o.d"
+  "CMakeFiles/ngt.dir/NGTQ/HierarchicalKmeans.cpp.o"
+  "CMakeFiles/ngt.dir/NGTQ/HierarchicalKmeans.cpp.o.d"
+  "CMakeFiles/ngt.dir/NGTQ/Optimizer.cpp.o"
+  "CMakeFiles/ngt.dir/NGTQ/Optimizer.cpp.o.d"
+  "CMakeFiles/ngt.dir/NGTQ/QbgCli.cpp.o"
+  "CMakeFiles/ngt.dir/NGTQ/QbgCli.cpp.o.d"
+  "CMakeFiles/ngt.dir/NGTQ/QuantizedGraph.cpp.o"
+  "CMakeFiles/ngt.dir/NGTQ/QuantizedGraph.cpp.o.d"
+  "CMakeFiles/ngt.dir/Node.cpp.o"
+  "CMakeFiles/ngt.dir/Node.cpp.o.d"
+  "CMakeFiles/ngt.dir/SharedMemoryAllocator.cpp.o"
+  "CMakeFiles/ngt.dir/SharedMemoryAllocator.cpp.o.d"
+  "CMakeFiles/ngt.dir/Thread.cpp.o"
+  "CMakeFiles/ngt.dir/Thread.cpp.o.d"
+  "CMakeFiles/ngt.dir/Tree.cpp.o"
+  "CMakeFiles/ngt.dir/Tree.cpp.o.d"
+  "CMakeFiles/ngt.dir/Version.cpp.o"
+  "CMakeFiles/ngt.dir/Version.cpp.o.d"
+  "libngt.pdb"
+  "libngt.so"
+  "libngt.so.2"
+  "libngt.so.2.1.3"
+)
+
+# Per-language clean rules from dependency scanning.
+foreach(lang CXX)
+  include(CMakeFiles/ngt.dir/cmake_clean_${lang}.cmake OPTIONAL)
+endforeach()
