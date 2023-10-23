@@ -23,7 +23,7 @@ reprozip docker run
 ```
 cd scripts
 make
-./data_gen 5000000 10
+./data_gen 5000000
 ```
 
 - Cache Line of CPU

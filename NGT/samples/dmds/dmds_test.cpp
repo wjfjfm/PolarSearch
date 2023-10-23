@@ -1,35 +1,40 @@
 
 #include	"NGT/NGTQ/QuantizedGraph.h"
 #include <chrono>
+#include <iomanip>
 
 #define K 100
 #define D 200
 
 float calcDis(vector<float> & A, vector<float> & B) {
-  double sum;
+  double sum_dis = 0;
   for (int i=0; i<A.size(); i++) {
     double diff = A[i] - B[i];
-    sum += diff * diff;
+    sum_dis += diff * diff;
   }
-  return sum;
+  return sum_dis;
 }
 
 int
 main(int argc, char **argv)
 {
   string	indexPath	= "index";
-  string	objectFile	= "./data/random_vectors.bin";
+  string	objectFile	= "./data/random_vectors_5M.bin";
   string	resultFile	= "./data/knn_graphs.bin";
 
   // index construction
   NGT::Property	property;
-  property.dimension = D;
-  property.edgeSizeForCreation = K+100;
+  property.edgeSizeForCreation = K;
+  property.edgeSizeForSearch = 0;
   property.batchSizeForCreation = 256;
+  property.insertionRadiusCoefficient = 2;
+  property.truncationThreshold = 0;
+  property.dimension = D;
+  property.threadPoolSize = 32;
+
   property.objectType = NGT::ObjectSpace::ObjectType::Float;
   property.distanceType = NGT::Index::Property::DistanceType::DistanceTypeL2;
-  property.graphType = NGT::Property::GraphType::GraphTypeKNNG;
-  property.threadPoolSize = 31;
+  property.graphType = NGT::Property::GraphType::GraphTypeONNG;
 
   std::cout << "creating the index framework..." << std::endl;
   NGT::Index::create(indexPath, property);
@@ -88,6 +93,7 @@ main(int argc, char **argv)
   std::vector<uint32_t> result;
   result.resize(K);
   size_t succ_cnt = 0;
+  double sum_dis = 0;
 
 
   start = std::chrono::high_resolution_clock::now();
@@ -101,23 +107,17 @@ main(int argc, char **argv)
 
     index.search(sc);
 
-    rsfile.read(reinterpret_cast<char*>(result.data()), K * sizeof(uint32_t));
-    // for (auto item: result) {
-    //   cout << item << ":" << calcDis(all_vec[item], query) << " " ;
-    // }
-    // cout << endl;
+    // rsfile.read(reinterpret_cast<char*>(result.data()), K * sizeof(uint32_t));
 
     unordered_set<uint32_t> check(result.begin(), result.end());
 
     for (size_t i = 0; i < objects.size(); i++) {
       // cout << objects[i].id - 1 << ":" << objects[i].distance << ":" << calcDis(all_vec[objects[i].id - 1], query);
+      sum_dis += calcDis(all_vec[objects[i].id - 1], query);
       if (check.count(objects[i].id - 1)) {
         succ_cnt++;
       }
     }
-
-    // cout << endl << endl;
-
   }
 
   end = std::chrono::high_resolution_clock::now();
@@ -127,7 +127,9 @@ main(int argc, char **argv)
   cout << "QPS: " << qps << endl;
 
   float recall = 100.0 * succ_cnt / (1.0 * length * K);
-  cout << endl << "Recall: " << recall << "%" << endl;
+  cout << "Recall: " << recall << "%" << endl;
+  cout << std::setprecision(20) << "Sum Dis: " << sum_dis << endl;
+  cout << std::setprecision(20) << "Avg Dis: " << sum_dis / (1.0 * length * K) << endl;
 
   return 0;
 }

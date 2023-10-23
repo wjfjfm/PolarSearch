@@ -158,7 +158,8 @@ int main(int argc, char* argv[]) {
       auto end = std::chrono::high_resolution_clock::now();
       auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - round_start).count();
       double qps = 10 * M * 1000 / duration;
-      std::cout << "N: " << n << ", qps: " << qps << std::endl;
+      double dps = 10 * M * M * 1000 / duration;
+      std::cout << "N: " << n << ", qps: " << qps << ", dps: " << dps << endl;
       round_start = std::chrono::high_resolution_clock::now();
     }
   }
