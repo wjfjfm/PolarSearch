@@ -7,7 +7,7 @@ main(int argc, char **argv)
 #ifdef NGTQ_QBG
   string	indexPath	= "index";
   string	objectFile	= "./data/sift-dataset-5k.tsv";
-  string	queryFile	= "./data/sift-query-3.tsv";
+  string	queryFile	= "./data/sift-dataset-5k.tsv";
 
   // index construction
   try {
@@ -73,7 +73,9 @@ main(int argc, char **argv)
     ifstream		is(queryFile);
     string		line;
     std::cout << "searching the index..." << std::endl;
+    int cnt = 0;
     while (getline(is, line)) {
+      if (++cnt > 5) break;
       vector<uint8_t>	query;
       {
 	stringstream	linestream(line);

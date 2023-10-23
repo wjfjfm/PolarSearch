@@ -6,6 +6,9 @@
 #include <cstdlib>
 #include <queue>
 #include <chrono>
+#include <cassert>
+
+using namespace std;
 
 struct Vector {
     std::vector<float> elements;
@@ -70,8 +73,23 @@ Vector genRandVec(int dimensions) {
   return std::move(v);
 }
 
-void writeFloat32VectorToFile(const std::vector<Vector>& vectors, const std::string& filename, const bool with_num) {
+void writeUInt32VectorToFile(std::vector<vector<uint32_t>>& vectors, const std::string& filename) {
   std::ofstream file(filename, std::ios::binary | std::ios::app);
+  if (!file) {
+      std::cerr << "Error opening file " << filename << std::endl;
+      return;
+  }
+
+  for (auto& vector : vectors) {
+    assert(vector.size() == 100);
+    file.write(reinterpret_cast<char*>(vector.data()), vector.size() * sizeof(uint32_t));
+  }
+
+  file.close();
+}
+
+void writeFloat32VectorToFile(std::vector<Vector>& vectors, const std::string& filename, const bool with_num) {
+  std::ofstream file(filename, std::ios::binary);
   if (!file) {
       std::cerr << "Error opening file " << filename << std::endl;
       return;
@@ -120,6 +138,7 @@ int main(int argc, char* argv[]) {
   auto start = std::chrono::high_resolution_clock::now();
 
   TopKQueue<IdDisPair> topk_que(K);
+  std::vector<std::vector<uint32_t> > knn_vectors;
   for (int n = 0; n < M; n++) {
     auto target_vector = randomVectors[n];
     for (int m = 0; m < M; m++) {
@@ -127,11 +146,13 @@ int main(int argc, char* argv[]) {
     }
 
     auto knn_queue = topk_que.dumpQueue();
-    std::vector<Vector> knn_vectors;
-    for (const auto & id_dis : knn_queue) {
-      knn_vectors.push_back(randomVectors[id_dis.id]);
+    std::vector<uint32_t> knn_ids;
+    for (auto &p : knn_queue) {
+      knn_ids.push_back(p.id);
+      // cout << p.dis << " ";
     }
-    writeFloat32VectorToFile(knn_vectors , "knn_graphs.bin", false);
+    // cout << endl;
+    knn_vectors.push_back(knn_ids);
 
     if (n % 10 == 0) {
       auto end = std::chrono::high_resolution_clock::now();
@@ -141,6 +162,9 @@ int main(int argc, char* argv[]) {
       round_start = std::chrono::high_resolution_clock::now();
     }
   }
+
+  writeUInt32VectorToFile(knn_vectors , "knn_graphs.bin");
+
 
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
