@@ -10,7 +10,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
-#include <map>
+#include <unordered_map>
 #include <cstring>
 #include <immintrin.h>
 #include <math.h>
@@ -54,16 +54,16 @@ struct heap_t {
     uint32_t largest = index;
 
     if (left < size && heap[left].dis > heap[largest].dis) {
-        largest = left;
+      largest = left;
     }
 
     if (right < size && heap[right].dis > heap[largest].dis) {
-        largest = right;
+      largest = right;
     }
 
     if (largest != index) {
-        std::swap(heap[index], heap[largest]);
-        heap_down(largest);
+      std::swap(heap[index], heap[largest]);
+      heap_down(largest);
     }
   }
 
@@ -131,13 +131,19 @@ class TopQue {
     for (uint32_t i=0; i<BATCH && i+id1 < M; i++) {
       dis1 = heap_max[i + id1];
       dis_ptr = ptr + i * BATCH;
-      for (uint32_t j=0; j<BATCH && j+id2 < M; j++) {
+      for (uint32_t j=0; j<BATCH && j+id2 < M; j++, dis_ptr++) {
+        if (i + id1 == j + id2) continue;
 
         if (*dis_ptr < dis1) {
           buf_ptr->id1 = i + id1;
           buf_ptr->id2 = j + id2;
           buf_ptr->dis = *dis_ptr;
           buf_ptr++;
+
+          // cout << "Debug: insert id1: " << i+id1
+          //      << ", id2: " << j + id2
+          //      << ", dis: " << *dis_ptr
+          //      << endl;
         }
 
         if (*dis_ptr < heap_max[j + id2]) {
@@ -145,11 +151,15 @@ class TopQue {
           buf_ptr->id2 = i + id1;
           buf_ptr->dis = *dis_ptr;
           buf_ptr++;
-        }
 
-        dis_ptr++;
+          // cout << "Debug: insert id1: " << i+id1
+          //      << ", id2: " << j + id2
+          //      << ", dis: " << *dis_ptr
+          //      << endl;
+        }
       }
     }
+
     if (buf_ptr == thread_buf) return;  // nothing new
 
     uint64_t cnt = buf_ptr - thread_buf;
@@ -166,9 +176,9 @@ class TopQue {
     uint64_t copy_to = next_tail % MAX_QUE;
 
     if (copy_to > copy_from) {
-      memcpy(&que[copy_from], thread_buf, cnt * sizeof(id2_dis_t));
+      memcpy(que + copy_from, thread_buf, cnt * sizeof(id2_dis_t));
     } else {
-      memcpy(&que[copy_from], thread_buf, (MAX_QUE - copy_from) * sizeof(id2_dis_t));
+      memcpy(que + copy_from, thread_buf, (MAX_QUE - copy_from) * sizeof(id2_dis_t));
       memcpy(que, thread_buf + (MAX_QUE - copy_from), copy_to * sizeof(id2_dis_t));
     }
 
@@ -179,15 +189,13 @@ class TopQue {
 
   // Must be single thread running
   void sort() {
+    unordered_map<uint64_t, uint64_t>::iterator itr;
     meta_lock.lock();
-    while (link_buf.begin() != link_buf.end()) {
-      auto ptr = link_buf.begin();
-      if (link_buf.count(ptr->second)) {
-        que_write = ptr->second;
-        link_buf.erase(ptr);
-      } else {
-        break;
-      }
+    itr = link_buf.find(que_write);
+    while (itr != link_buf.end()) {
+      que_write = itr->second;
+      link_buf.erase(itr);
+      itr = link_buf.find(que_write);
     }
     meta_lock.unlock();
 
@@ -197,6 +205,11 @@ class TopQue {
 
       if (heap.insert(id2_dis.dis, id2_dis.id2)) {
         heap_max[id2_dis.id1] = heap.heap[0].dis;
+        // cout << "Debug sort inert: "
+        //      << " id1: " << id2_dis.id1
+        //      << ", id2: " << id2_dis.id2
+        //      << ", dis: " << id2_dis.dis
+        //      << endl;
       }
 
       que_head++;
@@ -205,12 +218,14 @@ class TopQue {
   }
 
   void dump_output(const string output_path) {
+    assert(que_head == que_tail);
+    assert(que_write == que_tail);
     std::ofstream file(output_path, std::ios::binary);
     uint32_t *write_buf = (uint32_t*)malloc(K * sizeof(uint32_t));
     dis_id_t *heap;
 
     for (int i=0; i<M; i++) {
-      heap = heaps[0].heap;
+      heap = heaps[i].heap;
       for (int j=0; j<K; j++) {
         write_buf[j] = heap[j].id;
       }
@@ -232,7 +247,7 @@ class TopQue {
   atomic<uint64_t> que_head;
 
   mutex meta_lock;
-  map<uint64_t, uint64_t> link_buf;
+  unordered_map<uint64_t, uint64_t> link_buf;
 };
 
 float calcDis(const float* v1, const float* v2) {
@@ -271,7 +286,29 @@ void genRandVec(float* v) {
   }
 }
 
+float l2_dis(const float* v1, const float* v2) {
+  double sum = 0;
+  for (int i=0; i<D; i++) {
+    double diff = v1[i] - v2[i];
+    sum += diff * diff;
+  }
+
+  return sum;
+}
+
 void run_batch(float* distances, uint32_t id1, uint32_t id2) {
+  const float* v1 = vectors + id1 * D;
+  const float* v2 = vectors + id2 * D;
+
+  for (int i=0; i<BATCH; i++) {
+    for (int j=0; j<BATCH; j++) {
+      distances[i * BATCH + j] = l2_dis(v1 + i * D, v2 + j * D);
+    }
+  }
+}
+
+void run_batch_blas(float* distances, uint32_t id1, uint32_t id2) { }
+void run_batch_mm(float* distances, uint32_t id1, uint32_t id2) {
     const float* vectorsA = vectors + id1 * D;
     const float* vectorsB = vectors + id2 * D;
 
@@ -331,13 +368,13 @@ void read_from_file(string input_path) {
     vec_ptr += FILE_D;
 
     if (D != FILE_D) {
-      memset(vectors, 0, (D - FILE_D) * sizeof(float));
+      memset(vec_ptr, 0, (D - FILE_D) * sizeof(float));
       vec_ptr += D - FILE_D;
     }
   }
 
   if (BATCH_M != M) {
-    memset(vectors, 0, D * (BATCH_M - M) * sizeof(float));
+    memset(vec_ptr, 0, D * (BATCH_M - M) * sizeof(float));
   }
 
   ifs.close();
