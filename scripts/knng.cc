@@ -11,6 +11,7 @@
 #include <atomic>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 #include <immintrin.h>
 #include <math.h>
@@ -20,7 +21,7 @@ using namespace std;
 #define FILE_D 200
 #define D 208
 #define K 100
-#define MAX_QUE 10000000
+#define MAX_QUE 0x8000000
 #define MAX_FLOAT 1e30
 #define MAX_UINT32 0xffffffff
 #define BATCH 256
@@ -29,6 +30,7 @@ using namespace std;
 uint32_t M;
 uint32_t BATCH_M;
 float* vectors;
+uint32_t* ids;
 
 class TopQue;
 TopQue *topk_que;
@@ -44,9 +46,25 @@ struct id2_dis_t {
   float dis;
 };
 
-struct heap_t {
+class heap_t {
+ public:
+  float heap_top;
+
   dis_id_t *heap;
   uint32_t size;
+  uint32_t max_size;
+  unordered_set<uint32_t> edges;
+  std::mutex lock;
+
+  void init(dis_id_t* _heap, uint32_t _max_size) {
+    heap = _heap;
+    heap[0].dis = MAX_FLOAT;
+    heap[0].id = MAX_UINT32;
+    heap_top = MAX_FLOAT;
+    size = 1;
+    max_size = _max_size;
+    edges.reserve(max_size);
+  }
 
   void heap_down(uint32_t index) {
     uint32_t left = 2 * index + 1;
@@ -76,21 +94,32 @@ struct heap_t {
     }
   }
 
-  bool insert(float dis, uint32_t id) {
-    if (size == K) {
-      if (dis >= heap[0].dis) return false;
+  void insert(float dis, uint32_t id) {
+    if (size == max_size) {
+      if (dis >= heap[0].dis) return;
 
+      auto result = edges.insert(id);
+      if (result.second == false) return;
+
+      edges.erase(heap[0].id);
       heap[0].dis = dis;
       heap[0].id = id;
       heap_down(0);
-      return true;
+
+      heap_top = heap[0].dis;
+      return;
     }
+
+    auto result = edges.insert(id);
+    if (result.second == false) return;
 
     heap[size].dis = dis;
     heap[size].id = id;
     heap_up(size);
     size++;
-    return true;
+
+    // no need to replace heap_top because it is always MAX_FLOAT
+    // heap_top = dis;
   }
 };
 
@@ -98,128 +127,89 @@ class TopQue {
  public:
   TopQue(uint32_t M) {
     buf = (dis_id_t*)malloc(M * K * sizeof(dis_id_t));
-    heaps = (heap_t*)malloc(M * sizeof(heap_t));
-    heap_max = (float*)malloc(M * sizeof(float));
+    heaps = new heap_t[M];
     for (int i=0; i<M; i++) {
-      heap_t &item = heaps[i];
-      item.heap = buf + i * K;
-      item.heap[0].dis = MAX_FLOAT;
-      item.heap[0].id = MAX_UINT32;
-      item.size = 1;
-
-      heap_max[i] = MAX_FLOAT;
+      heaps[i].init(buf + i * K, K);
     }
 
-    que = (id2_dis_t*)malloc(MAX_QUE * sizeof(id2_dis_t));
-    que_head = 0;
-    que_tail = 0;
-    que_write = 0;
   }
 
   ~TopQue() {
     free(buf);
-    free(heaps);
-    free(heap_max);
-    free(que);
+    delete[] heaps;
   }
 
-  void insert_batch(float* const ptr, id2_dis_t* const thread_buf, uint32_t id1, uint32_t id2) {
-    float dis1;
-    id2_dis_t *buf_ptr = thread_buf;
-    float* dis_ptr = ptr;
 
-    for (uint32_t i=0; i<BATCH && i+id1 < M; i++) {
-      dis1 = heap_max[i + id1];
-      dis_ptr = ptr + i * BATCH;
-      for (uint32_t j=0; j<BATCH && j+id2 < M; j++, dis_ptr++) {
-        if (i + id1 == j + id2) continue;
+  void insert_batch(float* const distances, uint32_t* ids1, uint32_t* ids2) {
+    float* dis_ptr = distances;
 
-        if (*dis_ptr < dis1) {
-          buf_ptr->id1 = i + id1;
-          buf_ptr->id2 = j + id2;
-          buf_ptr->dis = *dis_ptr;
-          buf_ptr++;
+    for (dis_ptr = distances; dis_ptr < distances + BATCH * BATCH; dis_ptr += 16) {
+      _mm_prefetch(reinterpret_cast<const char*>(dis_ptr), _MM_HINT_T0);
+    }
 
-          // cout << "Debug: insert id1: " << i+id1
-          //      << ", id2: " << j + id2
-          //      << ", dis: " << *dis_ptr
-          //      << endl;
+    for (int i = 0; i < BATCH; i += 16) {
+      _mm_prefetch(reinterpret_cast<const char*>(ids1 + i), _MM_HINT_T0);
+    }
+
+    for (int i = 0; i < BATCH; i += 16) {
+      _mm_prefetch(reinterpret_cast<const char*>(ids2 + i), _MM_HINT_T0);
+    }
+
+    bool hold_lock = false;
+    for (uint32_t i=0; i<BATCH; i++) {
+      const uint32_t &id1 = ids1[i];
+      if (id1 >= M) continue;
+
+      heap_t &heap = heaps[id1];
+
+      dis_ptr = distances + i * BATCH;
+      for (uint32_t j=0; j<BATCH; j++, dis_ptr++) {
+        const uint32_t &id2 = ids2[j];
+        if (id2 >= M) continue;
+        if (id1 == id2) continue;
+        if (*dis_ptr > heap.heap_top) continue;
+
+        if (!hold_lock) {
+          heap.lock.lock();
+          hold_lock = true;
         }
 
-        if (*dis_ptr < heap_max[j + id2]) {
-          buf_ptr->id1 = j + id2;
-          buf_ptr->id2 = i + id1;
-          buf_ptr->dis = *dis_ptr;
-          buf_ptr++;
+        heap.insert(*dis_ptr, id2);
+      }
 
-          // cout << "Debug: insert id1: " << i+id1
-          //      << ", id2: " << j + id2
-          //      << ", dis: " << *dis_ptr
-          //      << endl;
+      if (hold_lock) heap.lock.unlock();
+    }
+
+    for (uint32_t j=0; j<BATCH; j++) {
+      const uint32_t &id2 = ids2[j];
+      if (id2 >= M) continue;
+
+      heap_t &heap = heaps[id2];
+
+      dis_ptr = distances + j;
+      for (uint32_t i=0; i<BATCH; i++, dis_ptr += BATCH) {
+        const uint32_t &id1 = ids1[i];
+        if (id1 >= M) continue;
+        if (id1 == id2) continue;
+        if (*dis_ptr >= heap.heap_top) continue;
+
+        if (!hold_lock) {
+          heap.lock.lock();
+          hold_lock = true;
         }
-      }
-    }
 
-    if (buf_ptr == thread_buf) return;  // nothing new
-
-    uint64_t cnt = buf_ptr - thread_buf;
-
-    uint64_t prev_tail = que_tail.fetch_add(cnt);
-    uint64_t next_tail = prev_tail + cnt;
-
-    while (next_tail - que_head > MAX_QUE) {
-      cout << "DEBUG: top que waiting..." <<endl;
-      std::this_thread::sleep_for(std::chrono::microseconds(10));
-    }
-
-    uint64_t copy_from = prev_tail % MAX_QUE;
-    uint64_t copy_to = next_tail % MAX_QUE;
-
-    if (copy_to > copy_from) {
-      memcpy(que + copy_from, thread_buf, cnt * sizeof(id2_dis_t));
-    } else {
-      memcpy(que + copy_from, thread_buf, (MAX_QUE - copy_from) * sizeof(id2_dis_t));
-      memcpy(que, thread_buf + (MAX_QUE - copy_from), copy_to * sizeof(id2_dis_t));
-    }
-
-    meta_lock.lock();
-    link_buf[prev_tail] = next_tail;
-    meta_lock.unlock();
-  }
-
-  // Must be single thread running
-  void sort() {
-    unordered_map<uint64_t, uint64_t>::iterator itr;
-    meta_lock.lock();
-    itr = link_buf.find(que_write);
-    while (itr != link_buf.end()) {
-      que_write = itr->second;
-      link_buf.erase(itr);
-      itr = link_buf.find(que_write);
-    }
-    meta_lock.unlock();
-
-    while (que_head < que_write) {
-      id2_dis_t &id2_dis = que[que_head % MAX_QUE];
-      heap_t &heap = heaps[id2_dis.id1];
-
-      if (heap.insert(id2_dis.dis, id2_dis.id2)) {
-        heap_max[id2_dis.id1] = heap.heap[0].dis;
-        // cout << "Debug sort inert: "
-        //      << " id1: " << id2_dis.id1
-        //      << ", id2: " << id2_dis.id2
-        //      << ", dis: " << id2_dis.dis
-        //      << endl;
+        heap.insert(*dis_ptr, id1);
       }
 
-      que_head++;
+      if (hold_lock) heap.lock.unlock();
     }
 
   }
+
 
   void dump_output(const string output_path) {
-    assert(que_head == que_tail);
-    assert(que_write == que_tail);
+    // kassert(que_head == que_tail);
+    // kassert(que_write == que_tail);
     std::ofstream file(output_path, std::ios::binary);
     uint32_t *write_buf = (uint32_t*)malloc(K * sizeof(uint32_t));
     dis_id_t *heap;
@@ -227,6 +217,7 @@ class TopQue {
     for (int i=0; i<M; i++) {
       heap = heaps[i].heap;
       for (int j=0; j<K; j++) {
+        assert(heap[j].id != MAX_UINT32);
         write_buf[j] = heap[j].id;
       }
       file.write(reinterpret_cast<char*>(write_buf), K * sizeof(uint32_t));
@@ -238,48 +229,8 @@ class TopQue {
 
   heap_t* heaps;
   dis_id_t* buf;
-  float* heap_max;
-
-  id2_dis_t* que;
-
-  atomic<uint64_t> que_tail;
-  atomic<uint64_t> que_write;
-  atomic<uint64_t> que_head;
-
-  mutex meta_lock;
-  unordered_map<uint64_t, uint64_t> link_buf;
 };
 
-float calcDis(const float* v1, const float* v2) {
-  int i;
-  __m512 sum = _mm512_setzero_ps();
-  __m512 diff, square;
-
-  for (i = 0; i < D; i += 16) {
-      // 使用 AVX-512 指令加载两个向量的数据
-      __m512 va = _mm512_loadu_ps(v1 + i);
-      __m512 vb = _mm512_loadu_ps(v2 + i);
-
-      // 计算差值
-      diff = _mm512_sub_ps(va, vb);
-
-      // 计算差值的平方
-      square = _mm512_mul_ps(diff, diff);
-
-      // 累加平方值
-      sum = _mm512_add_ps(sum, square);
-  }
-
-  // 将累加求和的结果水平加和
-  __m256 sum256 = _mm256_add_ps(_mm512_extractf32x8_ps(sum, 0), _mm512_extractf32x8_ps(sum, 1));
-  __m128 sum128 = _mm_add_ps(_mm256_extractf128_ps(sum256, 0), _mm256_extractf128_ps(sum256, 1));
-
-  // 水平加和结果向量
-  float distance = _mm_cvtss_f32(_mm_hadd_ps(sum128, sum128));
-  return distance;
-}
-
-// 生成一个随机向量
 void genRandVec(float* v) {
   for (int i = 0; i < D; i++) {
     v[i] = static_cast<float>(rand()) / RAND_MAX;
@@ -296,44 +247,62 @@ float l2_dis(const float* v1, const float* v2) {
   return sum;
 }
 
-void run_batch(float* distances, uint32_t id1, uint32_t id2) {
-  const float* v1 = vectors + id1 * D;
-  const float* v2 = vectors + id2 * D;
+float l2_dis_mm(const float* v1, const float* v2) {
+  __m512 sum, va, vb, square, diff;
 
+  sum = _mm512_setzero_ps();
+  for (int i=0; i<D; i += 16) {
+    va = _mm512_loadu_ps(v1 + i);
+    vb = _mm512_loadu_ps(v2 + i);
+    diff = _mm512_sub_ps(va, vb);
+    square = _mm512_mul_ps(diff, diff);
+    sum = _mm512_add_ps(sum, square);
+  }
+
+  return _mm512_reduce_add_ps(sum);
+
+}
+
+
+void run_batch(float* distances, float* v1, float* v2) {
   for (int i=0; i<BATCH; i++) {
     for (int j=0; j<BATCH; j++) {
-      distances[i * BATCH + j] = l2_dis(v1 + i * D, v2 + j * D);
+      distances[i * BATCH + j] = l2_dis_mm(v1 + i * D, v2 + j * D);
     }
   }
 }
 
-void run_batch_blas(float* distances, uint32_t id1, uint32_t id2) { }
-void run_batch_mm(float* distances, uint32_t id1, uint32_t id2) {
-    const float* vectorsA = vectors + id1 * D;
-    const float* vectorsB = vectors + id2 * D;
+void run_batch_mm(float* distances, const float* v1, const float* v2) {
+   int i, j, k, l;
+    __m512 diff, square, va, vb, reduce;
+    __m512 sum[16];
 
-   int i, j, k;
-    __m512 sum, diff, square;
+    for (int i = 0; i < BATCH * D; i += 16) {
+      _mm_prefetch(reinterpret_cast<const char*>(v1 + i), _MM_HINT_T0);
+    }
 
-    for (i = 0; i < BATCH && i+16<=M; i += 16) {
-      for (j = 0; j < BATCH && j+16<=M; j += 16) {
-        sum = _mm512_setzero_ps();
-        for (k = 0; k < D; k += 16) {
-            __m512 va = _mm512_loadu_ps(vectorsA + (i * D) + k);
-            __m512 vb;
-            for (int l = 0; l < 16; l++) {
-                vb = _mm512_set1_ps(vectorsB[(j * D) + k + l]);
-                diff = _mm512_sub_ps(va, vb);
-                square = _mm512_mul_ps(diff, diff);
-                sum = _mm512_add_ps(sum, square);
-            }
+    for (int i = 0; i < BATCH * D; i += 16) {
+      _mm_prefetch(reinterpret_cast<const char*>(v2 + i), _MM_HINT_T0);
+    }
+
+    for (i = 0; i < BATCH; i++) {
+      for (j = 0; j < BATCH; j += 16) {
+        for (l = 0; l < 16; l++) {
+          sum[l] = _mm512_setzero_ps();
         }
 
-        __m256 sum256 = _mm256_add_ps(_mm512_extractf32x8_ps(sum, 0), _mm512_extractf32x8_ps(sum, 1));
-        __m128 sum128 = _mm_add_ps(_mm256_extractf128_ps(sum256, 0), _mm256_extractf128_ps(sum256, 1));
+        for (k = 0; k < D; k += 16) {
+          va = _mm512_loadu_ps(v1 + (i * D) + k);
+          for (l = 0; l < 16; l++) {
+            vb = _mm512_loadu_ps(v2 + (j + l) * D + k);
+            diff = _mm512_sub_ps(va, vb);
+            sum[l] = _mm512_fmadd_ps(diff, diff, sum[l]);
+          }
+        }
 
-        // 存储计算得到的 L2 距离的平方
-        _mm_storeu_ps(distances + (i * BATCH) + j, _mm_hadd_ps(sum128, sum128));
+        for (l = 0; l < 16; l++) {
+          distances[i * BATCH + j + l] = _mm512_reduce_add_ps(sum[l]);
+        }
       }
     }
 }
@@ -358,6 +327,7 @@ void read_from_file(string input_path) {
             << std::endl;
 
   vectors = (float*)malloc(BATCH_M * D * sizeof(float));
+  ids = (uint32_t*)malloc(BATCH_M * sizeof(uint32_t));
 
   int counter = 0;
 
@@ -371,10 +341,16 @@ void read_from_file(string input_path) {
       memset(vec_ptr, 0, (D - FILE_D) * sizeof(float));
       vec_ptr += D - FILE_D;
     }
+
+    ids[i] = i;
   }
 
   if (BATCH_M != M) {
     memset(vec_ptr, 0, D * (BATCH_M - M) * sizeof(float));
+
+    for (int i=M; i<BATCH_M; i++) {
+      ids[i] = i;
+    }
   }
 
   ifs.close();
@@ -390,6 +366,7 @@ int main(int argc, char* argv[]) {
     BATCH_M = ((M - 1) / BATCH + 1) * BATCH;
 
     vectors = (float*)malloc(BATCH_M * D * sizeof(float));
+    ids = (uint32_t*)malloc(BATCH_M * sizeof(uint32_t));
 
     std::cout << "Random gen with"
               << " M: " << M
@@ -401,10 +378,15 @@ int main(int argc, char* argv[]) {
 
     for (int i = 0; i < M; i++) {
       genRandVec(vectors + i * D);
+      ids[i] = i;
     }
 
     if (BATCH_M != M) {
       memset(vectors + M * D, 0, D * (BATCH_M - M) * sizeof(float));
+
+      for (int i=M; i<BATCH_M; i++) {
+        ids[i] = i;
+      }
     }
   } else {
     if (argc == 3) {
@@ -421,14 +403,12 @@ int main(int argc, char* argv[]) {
   auto round_start = std::chrono::high_resolution_clock::now();
   auto start = std::chrono::high_resolution_clock::now();
 
-  id2_dis_t* thread_buf = (id2_dis_t*)malloc(2 * BATCH * BATCH * sizeof(id2_dis_t));
   float* dis_buf = (float*)malloc(BATCH * BATCH * sizeof(float));
 
   for (int n = 0; n < BATCH_M; n += BATCH) {
     for (int m = n; m < BATCH_M; m += BATCH) {
-      run_batch(dis_buf, n, m);
-      topk_que->insert_batch(dis_buf, thread_buf, n, m);
-      topk_que->sort();
+      run_batch_mm(dis_buf, vectors + n * D, vectors + m * D);
+      topk_que->insert_batch(dis_buf, ids + n, ids + m);
     }
 
     auto end = std::chrono::high_resolution_clock::now();
@@ -439,12 +419,12 @@ int main(int argc, char* argv[]) {
     round_start = std::chrono::high_resolution_clock::now();
   }
 
-  free(thread_buf);
   free(dis_buf);
 
   topk_que->dump_output(output_path);
 
   free(vectors);
+  free(ids);
   delete topk_que;
 
   auto end = std::chrono::high_resolution_clock::now();
