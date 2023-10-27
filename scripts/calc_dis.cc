@@ -3,12 +3,18 @@
 #include <string>
 #include <algorithm>
 #include <iomanip>
+#include <immintrin.h>
+#include <thread>
+#include <atomic>
+#include <cstring>
 
 using namespace std;
 
 uint32_t M;
 uint32_t K = 100;
-uint32_t D = 200;
+uint32_t D = 208;
+uint32_t FILE_D = 200;
+uint32_t THREAD = 32;
 
 void load_knng(string path, uint32_t *knng) {
   std::ifstream ifs;
@@ -62,6 +68,21 @@ double l2_dis(float* v1, float* v2) {
   return sum;
 }
 
+float l2_dis_mm(const float* v1, const float* v2) {
+  __m512 sum, va, vb, square, diff;
+
+  sum = _mm512_setzero_ps();
+  for (int i=0; i<D; i += 16) {
+    va = _mm512_loadu_ps(v1 + i);
+    vb = _mm512_loadu_ps(v2 + i);
+    diff = _mm512_sub_ps(va, vb);
+    square = _mm512_mul_ps(diff, diff);
+    sum = _mm512_add_ps(sum, square);
+  }
+
+  return _mm512_reduce_add_ps(sum);
+}
+
 void calc_dis(float* vectors, uint32_t* knng) {
   double sum = 0;
 
@@ -71,6 +92,43 @@ void calc_dis(float* vectors, uint32_t* knng) {
       float* v2 = vectors + knng[i * K + j] * D;
       sum += l2_dis(v1, v2);
     }
+  }
+
+  double avg = sum / M / K;
+
+  cout << setprecision(20) << "Total l2 dis: " << sum
+       << ", avg dis: " << avg
+       << endl << endl;
+}
+
+void calc_dis_task(float* vectors, uint32_t* knng, uint32_t from, uint32_t to, double *result) {
+  double sum = 0;
+
+  for (int i=from; i<to && i<M; i++) {
+    float* v1 = vectors + i * D;
+    for (int j=0; j<K; j++) {
+      float* v2 = vectors + knng[i * K + j] * D;
+      sum += l2_dis_mm(v1, v2);
+    }
+  }
+
+  *result = sum;
+}
+
+void calc_dis_mm(float* vectors, uint32_t* knng) {
+  vector<thread> threads;
+  uint32_t batch = M / THREAD;
+  vector<double> results(THREAD, 0);
+
+  double sum = 0;
+
+  for (int i=0; i<THREAD; i++) {
+    threads.emplace_back(calc_dis_task, vectors, knng, (M / THREAD) * i, (M / THREAD) * (i + 1), &results[i]);
+  }
+
+  for (int i=0; i<THREAD; i++) {
+    threads[i].join();
+    sum += results[i];
   }
 
   double avg = sum / M / K;
@@ -114,6 +172,7 @@ int main(int argc, char* argv[]) {
   }
 
   float* vectors = (float*)malloc(M * D * sizeof(float));
+  memset(vectors, 0, M * D * sizeof(float));
   uint32_t* outputs = (uint32_t*)malloc(M * K * sizeof(uint32_t));
   uint32_t* answers;
 
@@ -137,16 +196,16 @@ int main(int argc, char* argv[]) {
   cout << "Loading vectors" << endl;
   float* vec_ptr = vectors;
   for (int i=0; i<M; i++) {
-    ifs.read(reinterpret_cast<char*>(vec_ptr), D * sizeof(float));
+    ifs.read(reinterpret_cast<char*>(vec_ptr), FILE_D * sizeof(float));
     vec_ptr += D;
   }
   ifs.close();
 
   cout << "Calc output dis..." << endl;
-  calc_dis(vectors, outputs);
+  calc_dis_mm(vectors, outputs);
 
   if (with_answer) {
     cout << "Calc answers dis..." << endl;
-    calc_dis(vectors, answers);
+    calc_dis_mm(vectors, answers);
   }
 }
