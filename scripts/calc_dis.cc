@@ -142,7 +142,7 @@ int main(int argc, char* argv[]) {
 
   string output_path = "output.bin";
   string answer_path = "result.bin";
-  string vector_path = "input.bin";
+  string vector_path = "dummy-data.bin";
 
   bool with_answer = true;
 
@@ -164,7 +164,7 @@ int main(int argc, char* argv[]) {
   cout << "Calc Recall.." << endl
        << "M: " << M << endl
        << "K: " << K << endl
-       << "D: " << D << endl
+       << "D: " << FILE_D << endl
        << "output: " << output_path << endl;
 
   if (with_answer) {
