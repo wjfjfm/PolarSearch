@@ -7,6 +7,14 @@
 #include <thread>
 #include <atomic>
 #include <cstring>
+#include <unordered_set>
+#include <mutex>
+#include <vector>
+
+#define PRINT_DETAIL
+#define APPRO_NUM 1000
+#define MAX_FLOAT 1e30
+#define MAX_UINT32 0xffffffff
 
 using namespace std;
 
@@ -15,6 +23,14 @@ uint32_t K = 100;
 uint32_t D = 208;
 uint32_t FILE_D = 200;
 uint32_t THREAD = 32;
+
+float* vectors;
+uint32_t* outputs;
+
+std::mutex print_lock;
+atomic<size_t> total_hit = 0;
+atomic<size_t> total_num = 0;
+atomic<size_t> all_hit = 0;
 
 void load_knng(string path, uint32_t *knng) {
   std::ifstream ifs;
@@ -26,6 +42,104 @@ void load_knng(string path, uint32_t *knng) {
     vec_ptr += K;
   }
 }
+
+struct dis_id_t {
+  float dis;
+  uint32_t id;
+};
+
+class Heap {
+  public:
+  float heap_top;
+  uint32_t size;
+  dis_id_t *heap;
+  uint32_t max_size;
+
+  Heap(uint32_t _max_size) {
+    max_size = _max_size;
+    heap = (dis_id_t*)malloc(max_size * sizeof(dis_id_t));
+    heap[0].dis = MAX_FLOAT;
+    heap[0].id = MAX_UINT32;
+    heap_top = MAX_FLOAT;
+    size = 1;
+  }
+
+  ~Heap() {
+    free(heap);
+  }
+
+  inline void heap_down(uint32_t index) {
+    uint32_t left = 2 * index + 1;
+    uint32_t right = 2 * index + 2;
+    uint32_t largest = index;
+
+    while (true) {
+      if (left < size && heap[left].dis > heap[largest].dis) {
+        largest = left;
+      }
+
+      if (right < size && heap[right].dis > heap[largest].dis) {
+        largest = right;
+      }
+
+      if (largest == index) {
+        break;
+      }
+
+      std::swap(heap[index], heap[largest]);
+      index = largest;
+      left = 2 * index + 1;
+      right = 2 * index + 2;
+    }
+  }
+
+  void heap_up(uint32_t index) {
+    uint32_t parent = (index - 1) / 2;
+    while (index > 0 && heap[index].dis > heap[parent].dis) {
+      std::swap(heap[index], heap[parent]);
+      index = parent;
+      parent = (index - 1) / 2;
+    }
+  }
+
+  void insert(float dis, uint32_t id) {
+    if (size == max_size) {
+      if (dis >= heap_top) { return; }
+
+      heap[0].dis = dis;
+      heap[0].id = id;
+      heap_down(0);
+
+      heap_top = heap[0].dis;
+      return;
+    }
+
+    heap[size].dis = dis;
+    heap[size].id = id;
+    heap_up(size);
+    size++;
+  }
+
+  bool pop(uint32_t *id, float *dis) {
+    if (size == 0) return false;
+
+    *id = heap[0].id;
+    *dis = heap[0].dis;
+
+    size--;
+
+    if (size > 0) {
+      heap[0].id = heap[size].id;
+      heap[0].dis = heap[size].dis;
+      heap_down(0);
+    }
+
+    return true;
+  }
+
+};
+
+
 
 void calc_recall(uint32_t* outputs, uint32_t* answers) {
   size_t cnt = 0;
@@ -138,7 +252,102 @@ void calc_dis_mm(float* vectors, uint32_t* knng) {
        << endl << endl;
 }
 
+uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
+  Heap heap(K);
+  for (int i=0; i<M; i++) {
+    if (i == id) continue;
+    float dis = l2_dis_mm(vectors + id * D, vectors + i * D);
+    heap.insert(dis, i);
+  }
+
+  unordered_set<uint32_t> exist;
+  for(int i=0; i<K; i++) {
+    exist.insert(output[i]);
+  }
+
+#ifdef PRINT_DETAIL
+  int pos = K;
+  char* write_buf = (char*) malloc((K+1) * sizeof(char));
+  write_buf[pos--] = '\0';
+#else
+  int pos = K - 1;
+#endif
+
+  int hit = 0;
+  uint32_t rid;
+  float dis;
+
+#ifdef PRINT_DETAIL
+  uint32_t total_id_diff = 0;
+  float avg_id_diff = 0;
+  float max_dis, min_dis;
+#endif
+
+
+  for(int i=0; i<K; i++) {
+    heap.pop(&rid, &dis);
+
+    if (exist.count(rid)) {
+      hit++;
+
+#ifdef PRINT_DETAIL
+      write_buf[pos] = '+';
+#endif
+
+    } else {
+
+#ifdef PRINT_DETAIL
+      write_buf[pos] = '-';
+#endif
+    }
+
+#ifdef PRINT_DETAIL
+    if (pos == K-1) max_dis = dis;
+    else if (pos == 0) min_dis = dis;
+    total_id_diff += rid > id ? rid - id : id - rid;
+
+#endif
+    pos--;
+  }
+
+  total_hit.fetch_add(hit);
+  total_num++;
+
+  if (hit == 100) all_hit++;
+
+#ifdef PRINT_DETAIL
+  avg_id_diff = (double)total_id_diff / K;
+  float recall = 1.0 * total_hit / total_num / K;
+  float all_hit_rate = 1.0 * all_hit / total_num;
+
+  string color = "";
+
+  if (hit < 20) {
+    color = "\033[31m";
+  } else if (hit < 50) {
+    color = "\033[33m";
+  } else if (hit < 80) {
+    color = "\033[36m";
+  }
+
+  print_lock.lock();
+  fprintf(stdout, "Summary recall:%0.4f all_hit:%0.4f %sRecord: id:%10i hit:%3i min:%06.3f max:%06.3f id diff:%08f detail:%s\033[0m\n", recall, all_hit_rate, color.c_str(), id, hit, min_dis, max_dis, avg_id_diff, write_buf);
+  print_lock.unlock();
+#endif
+
+  return hit;
+}
+
+void recall_appro_task(size_t num) {
+  for (int i=0; i<num; i++) {
+    uint32_t rand_id = rand() % M;
+    calc_recall_appro(vectors, rand_id, outputs + rand_id * K);
+  }
+}
+
 int main(int argc, char* argv[]) {
+
+  srand(time(NULL));
 
   string output_path = "output.bin";
   string answer_path = "result.bin";
@@ -171,9 +380,9 @@ int main(int argc, char* argv[]) {
     cout << "answer: " << answer_path << endl;
   }
 
-  float* vectors = (float*)malloc(M * D * sizeof(float));
+  vectors = (float*)malloc(M * D * sizeof(float));
   memset(vectors, 0, M * D * sizeof(float));
-  uint32_t* outputs = (uint32_t*)malloc(M * K * sizeof(uint32_t));
+  outputs = (uint32_t*)malloc(M * K * sizeof(uint32_t));
   uint32_t* answers;
 
   if (with_answer) {
@@ -201,6 +410,23 @@ int main(int argc, char* argv[]) {
   }
   ifs.close();
 
+  if (!with_answer){
+    cout << "Calc Recall approximately..." << endl;
+    vector<thread> recall_threads;
+
+    for (int i=0; i<THREAD; i++) {
+      recall_threads.emplace_back(recall_appro_task, APPRO_NUM);
+    }
+
+    for (int i=0; i<THREAD; i++) {
+      recall_threads[i].join();
+    }
+
+    cout <<endl<< "Recall: " << 1.0 * total_hit / THREAD / APPRO_NUM / K << endl;
+  }
+
+
+
   cout << "Calc output dis..." << endl;
   calc_dis_mm(vectors, outputs);
 
@@ -208,4 +434,5 @@ int main(int argc, char* argv[]) {
     cout << "Calc answers dis..." << endl;
     calc_dis_mm(vectors, answers);
   }
+
 }

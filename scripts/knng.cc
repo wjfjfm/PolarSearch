@@ -28,15 +28,16 @@ using namespace std;
 #define MAX_UINT32 0xffffffff
 #define BATCH 256
 #define THREAD 40
-#define LINEAR_THREAD 10
+#define LINEAR_THREAD 20
 
+#define TASK_SET_SIZE 10000
 #define QUE_SIZE 200
 
-#define COMBINE_SIZE 10240
+#define COMBINE_SIZE 8192
 
-#define CROSS_SIZE 1024
+#define CROSS_SIZE 2048
 
-#define SEED_INACTIVE_K 1024
+#define SEED_INACTIVE_K 2048
 #define SEED_INACTIVE_DIS MAX_FLOAT
 
 #define TIME_LIMIT 27 * 60
@@ -61,6 +62,9 @@ atomic<size_t > seed_cnt = 0;
 atomic<size_t > inactive_seed_cnt = 0;
 atomic<size_t > combine_cnt = 0;
 atomic<size_t> rand_cnt = 0;
+
+atomic<uint32_t> search_round1 = 0;
+atomic<uint32_t> search_round2 = 0;
 
 class TopQue;
 TopQue *topk_que;
@@ -387,7 +391,7 @@ class TopQue {
     if (to > M) to = M;
 
     for (int i=from; i<to; i++) {
-      ques[i].lock();
+      // ques[i].lock();
       ques[i].final_sort();
       dis_id_t *heap = ques[i].que;
 
@@ -398,40 +402,11 @@ class TopQue {
       for (int j=0; j<K; j++) {
         write_buf[j] = heap[j].id;
       }
-      ques[i].unlock();
+      //ques[i].unlock();
 
       ssize_t bytesWritten = pwrite(fd, write_buf, K * sizeof(uint32_t), i * K * sizeof(uint32_t));
       assert(bytesWritten == K * sizeof(uint32_t));
     }
-#ifdef DEBUG
-    free(write_buf);
-#endif
-  }
-
-  void dump_output(const string output_path) {
-
-    std::ofstream file(output_path, std::ios::binary);
-    uint32_t *write_buf = (uint32_t*)malloc(K * sizeof(uint32_t));
-
-    for (int i=0; i<M; i++) {
-      ques[i].lock();
-      ques[i].final_sort();
-      dis_id_t *heap = ques[i].que;
-
-      if (ques[i].que_size < K) {
-        rand_cnt += K - ques[i].que_size;
-      }
-
-      for (int j=0; j<K; j++) {
-        write_buf[j] = heap[j].id;
-      }
-
-      file.write(reinterpret_cast<char*>(write_buf), K * sizeof(uint32_t));
-    }
-
-    cout << " Rand cnt: " << rand_cnt << " rate: " << 1.0 * rand_cnt / M / K << endl;
-
-
 #ifdef DEBUG
     free(write_buf);
 #endif
@@ -593,8 +568,8 @@ void print_stat(uint64_t batch) {
   double batch_ps = 1.0 * (new_cnt - old_value) * 1000 / duration;
   double dps = batch_ps * BATCH * BATCH;
   std::cout << "time: " << time(nullptr) - start_time << "\tbatch: " << new_cnt
-            << "\tseed_cnt: " << seed_cnt << " inactive: " << inactive_seed_cnt
-            << " combine: " << combine_cnt
+            << "\tseed_cnt: " << seed_cnt << " inactive: " << inactive_seed_cnt << " combine: " << combine_cnt
+            << "\tseed seek round1: " << search_round1 << " round2: " << search_round2
             << "\tthread linear: " << thread_linear << " combine: " << thread_combine
             << "\tbatch/s: " << (size_t)batch_ps << "\tdistance/s: " << dps << endl;
 
@@ -603,8 +578,6 @@ void print_stat(uint64_t batch) {
 uint32_t seed_seek_rand(uint32_t *seed_ids, float *seed_v) {
   size_t cnt = 0;
   uint64_t id;
-  static atomic<uint32_t> search_round1 = 0;
-  static atomic<uint32_t> search_round2 = 0;
 
   memset(seed_ids, 0xff, BATCH * sizeof(uint32_t));
 
@@ -617,6 +590,9 @@ uint32_t seed_seek_rand(uint32_t *seed_ids, float *seed_v) {
       id = search_round1.fetch_add(1);
       if (id >= M) continue;
       if (topk_que->ques[id].que_size == K) continue;
+    } else if (inactive_seed_cnt < M - 100000) {
+      id = rand() % M;
+      if (id >= M) continue;
     } else if (search_round2 < M) {
       id = search_round2.fetch_add(1);
       if (id >= M) continue;
@@ -771,18 +747,28 @@ void knng_task (uint32_t thread_id) {
   }
 
   while (time(NULL) < end_time) {
-    topk_que->lock.lock();
+    bool linear_task = false;
+    if (thread_id < LINEAR_THREAD) linear_task = true;
+    uint32_t *set_ids;
 
-    if (thread_id < LINEAR_THREAD || topk_que->tasks.size() == 0) {
-      topk_que->lock.unlock();
+    topk_que->lock.lock();
+    const uint32_t task_set_size = topk_que->tasks.size();
+
+    if (task_set_size == 0) linear_task = true;
+    if (task_set_size >= TASK_SET_SIZE) linear_task = false;
+
+    if (!linear_task) {
+      set_ids = topk_que->tasks.back();
+      topk_que->tasks.pop_back();
+    }
+
+    topk_que->lock.unlock();
+
+    if (linear_task) {
       thread_linear++;
       linear_search_task(dis_buf, heaps, seed_v, seed_ids);
       thread_linear--;
     } else {
-      uint32_t *set_ids = topk_que->tasks.back();
-      topk_que->tasks.pop_back();
-      topk_que->lock.unlock();
-
       if (!topk_que->ques[set_ids[0]].set_combine()) {
         free(set_ids);
         continue;
@@ -799,7 +785,6 @@ void knng_task (uint32_t thread_id) {
 
       thread_combine--;
     }
-
   }
 
 
