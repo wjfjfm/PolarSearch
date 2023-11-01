@@ -10,14 +10,13 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
-#include <unordered_map>
-#include <unordered_set>
 #include <cstring>
 #include <immintrin.h>
 #include <math.h>
 #include <ctime>
 #include <fcntl.h>
 #include <unistd.h>
+#include <iomanip>
 
 using namespace std;
 
@@ -36,23 +35,25 @@ using namespace std;
 #define THREAD 40
 #define LINEAR_THREAD 20
 
-#define CROSS_SIZE 2048
-#define COMBINE_SIZE 8192
+#define CROSS_SIZE 1024
+#define COMBINE_SIZE 4096
 
-#define SEED_INACTIVE_K 2048
-#define TASK_DISABLE_K 2048
+#define SEED_INACTIVE_K 1024
+#define TASK_DISABLE_K 1024
 
 #define SEED_INACTIVE_DIS MAX_FLOAT
 
 #define TIME_LIMIT 25 * 60
+#define TIME_RESERVE_OUTLIER  5 * 60
 
-// #define PACK
+#define PACK
 
 uint64_t M = 0;
 uint64_t BATCH_M;
 float* vectors;
 uint32_t* ids;
 time_t end_time;
+time_t outlier_time;
 time_t start_time;
 std::thread* load_thread;
 
@@ -391,8 +392,14 @@ class TopQue {
 
 
   void dump_output_task(int fd, uint32_t from ,uint32_t to) {
+    assert(from % 1024 == 0);
 
-    uint32_t *write_buf = (uint32_t*)malloc(K * sizeof(uint32_t));
+    const size_t buf_size = 1024;
+    uint32_t *write_ptr = (uint32_t*)malloc((buf_size * K + 0x4000) * sizeof(uint32_t));
+    uint32_t *write_buf = (uint32_t*)((uint64_t)(write_ptr + 0x4000) & (uint64_t)(~0x3fff));
+    uint32_t *buf_end = write_buf + buf_size * K;
+    uint32_t *buf_ptr = write_buf;
+    uint32_t  buf_first = from;
 
     if (to > M) to = M;
 
@@ -406,15 +413,29 @@ class TopQue {
       }
 
       for (int j=0; j<K; j++) {
-        write_buf[j] = heap[j].id;
+        *buf_ptr = heap[j].id;
+        buf_ptr++;
       }
-      //ques[i].unlock();
 
-      ssize_t bytesWritten = pwrite(fd, write_buf, K * sizeof(uint32_t), i * K * sizeof(uint32_t));
-      assert(bytesWritten == K * sizeof(uint32_t));
+      if (buf_ptr == buf_end) {
+        ssize_t bytesWritten = pwrite(fd, write_buf, (buf_ptr - write_buf) * sizeof(uint32_t), buf_first * K * sizeof(uint32_t));
+        assert(bytesWritten == buf_size * K * sizeof(uint32_t));
+        buf_first += buf_size;
+        buf_ptr = write_buf;
+      }
     }
+
+    if (buf_ptr != write_buf) {
+      ssize_t bytesWritten = pwrite(fd, write_buf, (buf_ptr - write_buf) * sizeof(uint32_t), buf_first * K * sizeof(uint32_t));
+      assert(bytesWritten == (buf_ptr - write_buf) * sizeof(uint32_t));
+      buf_first += (buf_ptr - write_buf) / K;
+      buf_ptr = write_buf;
+    }
+
+    assert(buf_first == to);
+
 #ifndef PACK
-    free(write_buf);
+    free(write_ptr);
 #endif
   }
 
@@ -611,7 +632,7 @@ void print_stat() {
   double combine_ps = combine_batch_ps * BATCH * BATCH;
   double dps = linear_ps + combine_ps;
 
-  float dps_balance = 1.0 * linear_cnt * LINEAR_SEED_BATCH / combine_cnt / BATCH;
+  float dps_balance = 1.0 * linear_cnt * LINEAR_SEED_BATCH / (linear_cnt * LINEAR_SEED_BATCH + combine_cnt * BATCH);
 
   std::cout << std::setprecision(2)
             << "time: " << time(nullptr) - start_time
@@ -620,7 +641,7 @@ void print_stat() {
             << "\tseed: set(" << seed_cnt << ") drop(" << inactive_seed_cnt << ")"
             << "\ttask: set(" << task_cnt << ") drop(" << task_drop_cnt << ")"
             << "\tthread: l(" << thread_linear << ") c(" << thread_combine << ")"
-            << "\tround2: " << search_round2
+            << "\tround: 1(" << search_round1 << ") 2(" << search_round2 << ")"
             << "\tbalance: " << dps_balance
             << endl;
 
@@ -633,18 +654,13 @@ uint32_t seed_seek_rand(uint32_t *seed_ids, float *seed_v) {
   memset(seed_ids, 0xff, LINEAR_SEED_BATCH * sizeof(uint32_t));
 
   while (cnt < LINEAR_SEED_BATCH) {
-    // if (inactive_seed_cnt < M >> 1) {
-    //   id = rand() % M;
-    //   if (id >= M) continue;
-    //   if (topk_que->ques[id].que_size == K) continue;
-    // } else if (search_round1 < M) {
-    //   id = search_round1.fetch_add(1);
-    //   if (id >= M) continue;
-    //   if (topk_que->ques[id].que_size == K) continue;
-    // } else
-    if (inactive_seed_cnt < M - 100000) {
+    if (time(NULL) < outlier_time) {
       id = rand() % M;
       if (id >= M) continue;
+    } else if (search_round1 < M) {
+      id = search_round1.fetch_add(1);
+      if (id >= M) continue;
+      if (topk_que->ques[id].que_size == K) continue;
     } else if (search_round2 < M) {
       id = search_round2.fetch_add(1);
       if (id >= M) continue;
@@ -861,6 +877,7 @@ void knng_task (uint32_t thread_id) {
 int main(int argc, char* argv[]) {
   start_time = time(nullptr);
   end_time = start_time + TIME_LIMIT;
+  outlier_time = end_time - TIME_RESERVE_OUTLIER;
   srand(time(NULL));
 
   string input_path = "dummy-data.bin";
@@ -908,11 +925,12 @@ int main(int argc, char* argv[]) {
 
   int fd = open(output_path.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
   int to = 0;
-  for (int from = 0; from < M; from = to) {
-    to = from + (M - 1) / THREAD + 1;
+  int step = M / THREAD;
+  step = step - step % 1024;
+
+  for (int from = 0; from < M; from = to, to = from + step) {
     dump_threads.emplace_back(&TopQue::dump_output_task, topk_que, fd, from, to);
   }
-  // topk_que->dump_output(output_path);
 
   for (int i=0; i<dump_threads.size(); i++) {
     dump_threads[i].join();
