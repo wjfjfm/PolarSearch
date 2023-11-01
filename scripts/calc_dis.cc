@@ -34,6 +34,7 @@ atomic<size_t> all_hit = 0;
 
 atomic<size_t> accurate_hit = 0;
 atomic<size_t> accurate_num = 0;
+atomic<size_t> outlier_num = 0;
 
 
 void load_knng(string path, uint32_t *knng) {
@@ -333,11 +334,16 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
     accurate_num++;
   }
 
-  float accurate_recall = 1.0 * accurate_hit / accurate_num / K;
-  float recall = 1.0 * total_hit / total_num / K;
+  if (hit < 20) {
+    outlier_num++;
+  }
+
+  float accurate_recall = 100.0 * accurate_hit / accurate_num / K;
+  float recall = 100.0 * total_hit / total_num / K;
+  float outlier_rate = 100.0 * outlier_num / total_num;
 
   print_lock.lock();
-  fprintf(stdout, "recall:%0.4f acc_recal:%0.4f %sid:%7i hit:%3i min:%06.3f max:%06.3f:%s\033[0m\n", recall, accurate_recall, color.c_str(), id, hit, min_dis, max_dis, write_buf);
+  fprintf(stdout, "recall:%04.2f%% acc_recall:%04.2f%% out rate:%04.2f%% %sid:%7i hit:%3i min:%06.3f max:%06.3f:%s\033[0m\n", recall, accurate_recall, outlier_rate, color.c_str(), id, hit, min_dis, max_dis, write_buf);
   print_lock.unlock();
 #endif
 

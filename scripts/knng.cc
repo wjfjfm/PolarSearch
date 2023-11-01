@@ -32,21 +32,28 @@ using namespace std;
 #define QUE_SIZE 200
 #define TASK_SET_SIZE 500
 
+#define HASH_MAP_SIZE 65536
+#define HASH_BITMAP 0xffff
+#define HASH_SHIFT 16
+
 #define THREAD 40
-#define LINEAR_THREAD 20
+#define LINEAR_THREAD 30
 
-#define CROSS_SIZE 1024
-#define COMBINE_SIZE 4096
+#define CROSS_SIZE 2048
+#define COMBINE_SIZE 2048
 
-#define SEED_INACTIVE_K 1024
-#define TASK_DISABLE_K 1024
+#define SEED_INACTIVE_K 2048
+#define TASK_DISABLE_K 2048
 
 #define SEED_INACTIVE_DIS MAX_FLOAT
 
-#define TIME_LIMIT 25 * 60
-#define TIME_RESERVE_OUTLIER  5 * 60
+#define TIME_END 28 * 60
+#define TIME_OUTLIER 15 * 60
+#define TIME_SINGLE 20 * 60
+#define TIME_RESERVE_TASK 20
 
 #define PACK
+#define NO_FREE
 
 uint64_t M = 0;
 uint64_t BATCH_M;
@@ -54,6 +61,7 @@ float* vectors;
 uint32_t* ids;
 time_t end_time;
 time_t outlier_time;
+time_t single_time;
 time_t start_time;
 std::thread* load_thread;
 
@@ -70,8 +78,7 @@ atomic<size_t > task_cnt = 0;
 atomic<size_t > task_drop_cnt = 0;
 atomic<size_t> rand_cnt = 0;
 
-atomic<uint32_t> search_round1 = 0;
-atomic<uint32_t> search_round2 = 0;
+atomic<uint32_t> single_round = 0;
 
 class TopQue;
 TopQue *topk_que;
@@ -239,13 +246,6 @@ struct merge_que_t {
     return;
   }
 
-  void insert_batch_2(float *dis, uint32_t *ids) {
-    for (int i=0; i<BATCH; i++) {
-      if (ids[i] >= M) continue;
-      insert(dis[i * BATCH], ids[i]);
-    }
-  }
-
   void insert_batch(float *dis, uint32_t *ids) {
     for (int i=0; i<BATCH; i++) {
       if (ids[i] >= M) continue;
@@ -364,29 +364,58 @@ class TopQue {
 
   ~TopQue() {
 
-#ifndef PACK
+#ifndef NO_FREE
     free(buf);
     free(ques);
 #endif
   }
 
 
-  void insert_batch_v1(float* const distances, uint32_t* ids1, uint32_t* ids2) {
-    float* dis_ptr = distances;
-
+  void insert_batch_v1(const float* const distances, const uint32_t* ids1, const uint32_t* ids2) {
     for (uint32_t i=0; i<BATCH; i++) {
       const uint32_t &id1 = ids1[i];
       if (id1 >= M) continue;
-      ques[id1].insert_batch(distances + i * BATCH, ids2);
+      merge_que_t &que = ques[id1];
+      const float *dis = distances + i * BATCH;
+
+      for (int j=0; j<BATCH; j++) {
+        const uint32_t &id2 = ids2[j];
+        if (id2 >= M) continue;
+        que.insert(*dis, id2);
+        dis++;
+      }
     }
   }
 
-  void insert_batch_v2(float* const distances, uint32_t* ids1, uint32_t* ids2) {
-    float* dis_ptr = distances;
+  void insert_batch_v2(const float* const distances, const uint32_t* ids1, const uint32_t* ids2) {
     for (uint32_t j=0; j<BATCH; j++) {
       const uint32_t &id2 = ids2[j];
       if (id2 >= M) continue;
-      ques[id2].insert_batch_2(distances + j, ids1);
+      const float *dis = distances + j;
+      merge_que_t &que = ques[id2];
+
+      for (int i=0; i<BATCH; i++) {
+        const uint32_t &id1 = ids1[i];
+        if (id1 >= M) continue;
+        que.insert(*dis, id1);
+        dis += BATCH;
+      }
+    }
+  }
+
+  void insert_linear_batch(const float* const distances, const uint32_t* ids1, const uint32_t* ids2) {
+    for (uint32_t j=0; j<BATCH; j++) {
+      const uint32_t &id2 = ids2[j];
+      if (id2 >= M) continue;
+      const float *dis = distances + j;
+      merge_que_t &que = ques[id2];
+
+      for (int i=0; i<LINEAR_SEED_BATCH; i++) {
+        const uint32_t &id1 = ids1[i];
+        if (id1 >= M) continue;
+        que.insert(*dis, id1);
+        dis += LINEAR_SEED_BATCH;
+      }
     }
   }
 
@@ -434,7 +463,7 @@ class TopQue {
 
     assert(buf_first == to);
 
-#ifndef PACK
+#ifndef NO_FREE
     free(write_ptr);
 #endif
   }
@@ -611,6 +640,7 @@ void print_stat() {
   static auto last_time = std::chrono::high_resolution_clock::now();
   static atomic<size_t> last_linear = 0;
   static atomic<size_t> last_combine = 0;
+  static atomic<size_t> last_single = 0;
   static size_t print_interval = 50000;
 
 
@@ -620,13 +650,16 @@ void print_stat() {
 
   size_t linear_cnt = linear_batch_cnt;
   size_t combine_cnt = combine_batch_cnt;
+  size_t single_cnt = single_round;
 
   double linear_batch_ps = 1.0 * (linear_cnt - last_linear) * 1000 / duration;
   double combine_batch_ps = 1.0 * (combine_cnt - last_combine) * 1000 / duration;
+  double single_ps = 1.0 * (single_cnt - last_single) * 1000 / duration;
 
 
   last_linear = linear_cnt;
   last_combine = combine_cnt;
+  last_single = single_cnt;
 
   double linear_ps = linear_batch_ps * LINEAR_SEED_BATCH * BATCH;
   double combine_ps = combine_batch_ps * BATCH * BATCH;
@@ -640,9 +673,8 @@ void print_stat() {
             << "\tbps: l(" << (size_t)linear_batch_ps << ") c(" << (size_t)combine_batch_ps << ")"
             << "\tseed: set(" << seed_cnt << ") drop(" << inactive_seed_cnt << ")"
             << "\ttask: set(" << task_cnt << ") drop(" << task_drop_cnt << ")"
-            << "\tthread: l(" << thread_linear << ") c(" << thread_combine << ")"
-            << "\tround: 1(" << search_round1 << ") 2(" << search_round2 << ")"
-            << "\tbalance: " << dps_balance
+            << "\tthread: l(" << thread_linear << ") c(" << thread_combine << ")" << " l/lc(" << dps_balance << ")"
+            << "\tsingle: round(" << last_single << ") ps(" << single_ps << ")"
             << endl;
 
 }
@@ -654,19 +686,8 @@ uint32_t seed_seek_rand(uint32_t *seed_ids, float *seed_v) {
   memset(seed_ids, 0xff, LINEAR_SEED_BATCH * sizeof(uint32_t));
 
   while (cnt < LINEAR_SEED_BATCH) {
-    if (time(NULL) < outlier_time) {
-      id = rand() % M;
-      if (id >= M) continue;
-    } else if (search_round1 < M) {
-      id = search_round1.fetch_add(1);
-      if (id >= M) continue;
-      if (topk_que->ques[id].que_size == K) continue;
-    } else if (search_round2 < M) {
-      id = search_round2.fetch_add(1);
-      if (id >= M) continue;
-    } else {
-      return cnt;
-    }
+    id = rand() % M;
+    if (id >= M) continue;
 
     if (!topk_que->ques[id].set_seed()) {
       continue;
@@ -686,8 +707,12 @@ bool linear_search(float *dis_buf, const uint32_t* seed_ids, const float* seed_v
   }
 
   size_t cnt = 0;
+  bool insert_v2 = false;
+
   for (uint64_t m = 0; m < BATCH_M; m += BATCH) {
     run_linear_batch_mm(dis_buf, seed_v, vectors + m * D);
+
+    if (insert_v2) topk_que->insert_linear_batch(dis_buf, seed_ids, ids + m);
 
     for (uint32_t i=0; i<LINEAR_SEED_BATCH; i++) {
       if (seed_ids[i] == MAX_UINT32) continue;
@@ -696,7 +721,9 @@ bool linear_search(float *dis_buf, const uint32_t* seed_ids, const float* seed_v
 
     cnt++;
     if (cnt > 1000) {
-      if (time(NULL) >= end_time) return false;
+      const time_t time_now = time(NULL);
+      if (time_now >= end_time) return false;
+      if (time_now >= outlier_time) insert_v2 = true;
       linear_batch_cnt.fetch_add(cnt);
       cnt = 0;
 
@@ -733,6 +760,42 @@ void cross_search(float* dis_buf, uint32_t *ids1, float* v1) {
     }
   }
   combine_batch_cnt.fetch_add(cnt);
+}
+
+bool hash_check_and_set(uint32_t *hash_map, uint32_t id1, uint32_t id2) {
+  const uint32_t hash_val = (id1 << 16) + (id2 >> 16);
+  uint32_t &hash_slot = hash_map[id2 & HASH_BITMAP];
+
+  if (hash_slot == hash_val) return true;
+
+  hash_slot = hash_val;
+  return false;
+}
+
+void single_search(uint32_t id, uint32_t *hash_map, uint32_t *ids2, uint32_t *ids3) {
+  merge_que_t &que1 = topk_que->ques[id];
+  que1.lock();
+  for (int i=0; i<K; i++) {
+    ids2[i] = que1.que[i].id;
+  }
+  que1.unlock();
+
+  for (int i=0; i<K; i++) {
+    const uint32_t id2 = ids2[i];
+    merge_que_t &que2 = topk_que->ques[id2];
+    que2.lock();
+    for (int j=0; j<K; j++) {
+      ids3[j] = que2.que[j].id;
+    }
+    que2.unlock();
+
+    for (int j=0; j<K; j++) {
+      const uint32_t id3 = ids3[j];
+      if (hash_check_and_set(hash_map, id, id3)) continue;
+      const float dis = l2_dis_mm(vectors + id * D, vectors + id3 * D);
+      que1.insert(dis, id3);
+    }
+  }
 }
 
 void linear_search_task(float* dis_buf, heap_t* heaps, float* seed_v, uint32_t *seed_ids) {
@@ -814,6 +877,7 @@ void knng_task (uint32_t thread_id) {
   float* v1 = (float*)malloc(CROSS_SIZE * D * sizeof(float));
   float* v2 = (float*)malloc(COMBINE_SIZE * D * sizeof(float));
 
+
   for (uint64_t i=0; i<LINEAR_SEED_BATCH; i++) {
     heaps[i].init(buf + i * (CROSS_SIZE + COMBINE_SIZE) , CROSS_SIZE + COMBINE_SIZE);
   }
@@ -822,9 +886,10 @@ void knng_task (uint32_t thread_id) {
     std::this_thread::sleep_for(std::chrono::microseconds(1000));
   }
 
-  while (time(NULL) < end_time) {
+  while (time(NULL) < single_time) {
     bool linear_task = false;
     if (thread_id < LINEAR_THREAD) linear_task = true;
+    if (time(NULL) >= end_time - TIME_RESERVE_TASK) linear_task = false;
     uint32_t *set_ids;
 
     topk_que->lock.lock();
@@ -859,7 +924,8 @@ void knng_task (uint32_t thread_id) {
   }
 
 
-#ifndef PACK
+
+#ifndef NO_FREE
   free(dis_buf);
   free(v1);
   free(v2);
@@ -871,13 +937,30 @@ void knng_task (uint32_t thread_id) {
   free(heaps);
 #endif
 
+  uint32_t* hash_map = (uint32_t*)malloc(HASH_MAP_SIZE * sizeof(uint32_t));
+  uint32_t *ids1 = (uint32_t*)malloc(K * sizeof(uint32_t));
+  uint32_t *ids2 = (uint32_t*)malloc(K * sizeof(uint32_t));
+
+  while (time(NULL) < end_time) {
+    uint32_t id = single_round.fetch_add(1);
+    if (id == M) single_round.store(0);
+    single_search(id, hash_map, ids1, ids2);
+  }
+
+#ifndef NO_FREE
+  free(hash_map);
+  free(ids1);
+  free(ids2);
+#endif
+
   thread_running--;
 }
 
 int main(int argc, char* argv[]) {
   start_time = time(nullptr);
-  end_time = start_time + TIME_LIMIT;
-  outlier_time = end_time - TIME_RESERVE_OUTLIER;
+  end_time = start_time + TIME_END;
+  outlier_time = start_time + TIME_OUTLIER;
+  single_time = start_time + TIME_SINGLE;
   srand(time(NULL));
 
   string input_path = "dummy-data.bin";
@@ -937,7 +1020,7 @@ int main(int argc, char* argv[]) {
   }
   close(fd);
 
-#ifndef PACK
+#ifndef NO_FREE
   for (int i=0; i<THREAD; i++) {
     threads[i].join();
   }
@@ -952,7 +1035,7 @@ int main(int argc, char* argv[]) {
   cout << "Freeing ... Time: " << time(nullptr) - start_time << endl;
 
 
-#ifndef PACK
+#ifndef NO_FREE
   free(vectors);
   free(ids);
   delete topk_que;
