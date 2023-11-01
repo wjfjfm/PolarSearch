@@ -36,20 +36,20 @@ using namespace std;
 #define HASH_BITMAP 0xffff
 #define HASH_SHIFT 16
 
-#define THREAD 40
+#define THREAD 36
 #define LINEAR_THREAD 30
 
 #define CROSS_SIZE 2048
-#define COMBINE_SIZE 2048
+#define COMBINE_SIZE 4096
 
 #define SEED_INACTIVE_K 2048
 #define TASK_DISABLE_K 2048
 
 #define SEED_INACTIVE_DIS MAX_FLOAT
 
-#define TIME_END 28 * 60
-#define TIME_OUTLIER 15 * 60
-#define TIME_SINGLE 20 * 60
+#define TIME_END 29 * 60
+#define TIME_OUTLIER 29 * 60
+#define TIME_SINGLE 29 * 60
 #define TIME_RESERVE_TASK 20
 
 #define PACK
@@ -774,6 +774,7 @@ bool hash_check_and_set(uint32_t *hash_map, uint32_t id1, uint32_t id2) {
 
 void single_search(uint32_t id, uint32_t *hash_map, uint32_t *ids2, uint32_t *ids3) {
   merge_que_t &que1 = topk_que->ques[id];
+  const float* const v1 = vectors + id * D;
   que1.lock();
   for (int i=0; i<K; i++) {
     ids2[i] = que1.que[i].id;
@@ -792,7 +793,7 @@ void single_search(uint32_t id, uint32_t *hash_map, uint32_t *ids2, uint32_t *id
     for (int j=0; j<K; j++) {
       const uint32_t id3 = ids3[j];
       if (hash_check_and_set(hash_map, id, id3)) continue;
-      const float dis = l2_dis_mm(vectors + id * D, vectors + id3 * D);
+      const float dis = l2_dis_mm(v1, vectors + id3 * D);
       que1.insert(dis, id3);
     }
   }
