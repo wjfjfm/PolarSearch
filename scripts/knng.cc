@@ -28,6 +28,7 @@ using namespace std;
 #define MAX_UINT32 0xffffffff
 #define BATCH 256
 #define THREAD 40
+#define LINEAR_THREAD 10
 
 #define QUE_SIZE 200
 
@@ -769,12 +770,10 @@ void knng_task (uint32_t thread_id) {
     std::this_thread::sleep_for(std::chrono::microseconds(1000));
   }
 
-  uint32_t task_keep_wm = thread_id * 20;
-
   while (time(NULL) < end_time) {
     topk_que->lock.lock();
 
-    if (topk_que->tasks.size() <= task_keep_wm) {
+    if (thread_id < LINEAR_THREAD || topk_que->tasks.size() == 0) {
       topk_que->lock.unlock();
       thread_linear++;
       linear_search_task(dis_buf, heaps, seed_v, seed_ids);
