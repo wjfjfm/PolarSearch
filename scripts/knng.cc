@@ -27,23 +27,26 @@ using namespace std;
 #define MAX_FLOAT 1e30
 #define MAX_UINT32 0xffffffff
 #define BATCH 256
+
+#define LINEAR_SEED_BATCH 32
+
+#define QUE_SIZE 200
+#define TASK_SET_SIZE 500
+
 #define THREAD 40
 #define LINEAR_THREAD 20
 
-#define TASK_SET_SIZE 10000
-#define QUE_SIZE 200
-
+#define CROSS_SIZE 2048
 #define COMBINE_SIZE 8192
 
-#define CROSS_SIZE 2048
-
 #define SEED_INACTIVE_K 2048
+#define TASK_DISABLE_K 2048
+
 #define SEED_INACTIVE_DIS MAX_FLOAT
 
-#define TIME_LIMIT 27 * 60
+#define TIME_LIMIT 25 * 60
 
-#define DEBUG
-#define PACK
+// #define PACK
 
 uint64_t M = 0;
 uint64_t BATCH_M;
@@ -60,7 +63,10 @@ atomic<uint32_t> thread_combine = 0;
 
 atomic<size_t > seed_cnt = 0;
 atomic<size_t > inactive_seed_cnt = 0;
-atomic<size_t > combine_cnt = 0;
+atomic<size_t> linear_batch_cnt = 0;
+atomic<size_t> combine_batch_cnt = 0;
+atomic<size_t > task_cnt = 0;
+atomic<size_t > task_drop_cnt = 0;
 atomic<size_t> rand_cnt = 0;
 
 atomic<uint32_t> search_round1 = 0;
@@ -100,7 +106,7 @@ struct merge_que_t {
   std::mutex *insert_lock;
   std::atomic_flag sort_lock = ATOMIC_FLAG_INIT;
   std::atomic_flag seed = ATOMIC_FLAG_INIT;
-  std::atomic_flag combine = ATOMIC_FLAG_INIT;
+  std::atomic_flag task = ATOMIC_FLAG_INIT;
 
   inline bool set_seed() {
     if(!seed.test_and_set(std::memory_order_acquire)) {
@@ -116,15 +122,15 @@ struct merge_que_t {
     }
   }
 
-  inline bool set_combine() {
-    if (!combine.test_and_set(std::memory_order_acquire)) {
-      combine_cnt++;
+  inline bool set_task() {
+    if (!task.test_and_set(std::memory_order_acquire)) {
+      task_cnt++;
       return true;
     }
     return false;
   }
-  inline void disable_combine() {
-    combine.test_and_set(std::memory_order_acquire);
+  inline void disable_task() {
+    task.test_and_set(std::memory_order_acquire);
   }
 
   inline void lock() {
@@ -155,7 +161,7 @@ struct merge_que_t {
     insert_lock = new mutex();
     sort_lock.clear();
     seed.clear();
-    combine.clear();
+    task.clear();
 
     hwm = MAX_FLOAT;
     que_size = 0;
@@ -357,7 +363,7 @@ class TopQue {
 
   ~TopQue() {
 
-#ifdef DEBUG
+#ifndef PACK
     free(buf);
     free(ques);
 #endif
@@ -407,7 +413,7 @@ class TopQue {
       ssize_t bytesWritten = pwrite(fd, write_buf, K * sizeof(uint32_t), i * K * sizeof(uint32_t));
       assert(bytesWritten == K * sizeof(uint32_t));
     }
-#ifdef DEBUG
+#ifndef PACK
     free(write_buf);
 #endif
   }
@@ -455,6 +461,41 @@ void run_batch(float* distances, float* v1, float* v2) {
   for (int i=0; i<BATCH; i++) {
     for (int j=0; j<BATCH; j++) {
       distances[i * BATCH + j] = l2_dis_mm(v1 + i * D, v2 + j * D);
+    }
+  }
+}
+
+void run_linear_batch_mm(float* distances, const float* v1, const float* v2) {
+  int i, j, k, l;
+  __m512 diff, square, va, vb, reduce;
+  __m512 sum[16];
+
+  for (int i = 0; i < LINEAR_SEED_BATCH * D; i += 16) {
+    _mm_prefetch(reinterpret_cast<const char*>(v1 + i), _MM_HINT_T0);
+  }
+
+  for (int i = 0; i < BATCH * D; i += 16) {
+    _mm_prefetch(reinterpret_cast<const char*>(v2 + i), _MM_HINT_T0);
+  }
+
+  for (i = 0; i < LINEAR_SEED_BATCH; i++) {
+    for (j = 0; j < BATCH; j += 16) {
+      for (l = 0; l < 16; l++) {
+        sum[l] = _mm512_setzero_ps();
+      }
+
+      for (k = 0; k < D; k += 16) {
+        va = _mm512_loadu_ps(v1 + (i * D) + k);
+        for (l = 0; l < 16; l++) {
+          vb = _mm512_loadu_ps(v2 + (j + l) * D + k);
+          diff = _mm512_sub_ps(va, vb);
+          sum[l] = _mm512_fmadd_ps(diff, diff, sum[l]);
+        }
+      }
+
+      for (l = 0; l < 16; l++) {
+        distances[i * BATCH + j + l] = _mm512_reduce_add_ps(sum[l]);
+      }
     }
   }
 }
@@ -545,33 +586,43 @@ void read_from_file(string input_path) {
   load_finished.store(true);
 }
 
-void print_stat(uint64_t batch) {
-  static atomic<size_t> batch_cnt = 0;
+void print_stat() {
   static auto last_time = std::chrono::high_resolution_clock::now();
-  static atomic<size_t> last_batch = 0;
+  static atomic<size_t> last_linear = 0;
+  static atomic<size_t> last_combine = 0;
   static size_t print_interval = 50000;
 
-  size_t cnt = batch_cnt.fetch_add(batch);
-
-  size_t new_cnt = cnt + batch;
-
-  size_t old_value = 0;
-  while (!last_batch.compare_exchange_weak(old_value, new_cnt)) {
-    if (new_cnt < print_interval + old_value) {
-      return;
-    }
-  }
 
   auto time_now =std::chrono::high_resolution_clock::now();
   size_t duration = std::chrono::duration_cast<std::chrono::milliseconds>(time_now - last_time).count();
   last_time = time_now;
-  double batch_ps = 1.0 * (new_cnt - old_value) * 1000 / duration;
-  double dps = batch_ps * BATCH * BATCH;
-  std::cout << "time: " << time(nullptr) - start_time << "\tbatch: " << new_cnt
-            << "\tseed_cnt: " << seed_cnt << " inactive: " << inactive_seed_cnt << " combine: " << combine_cnt
-            << "\tseed seek round1: " << search_round1 << " round2: " << search_round2
-            << "\tthread linear: " << thread_linear << " combine: " << thread_combine
-            << "\tbatch/s: " << (size_t)batch_ps << "\tdistance/s: " << dps << endl;
+
+  size_t linear_cnt = linear_batch_cnt;
+  size_t combine_cnt = combine_batch_cnt;
+
+  double linear_batch_ps = 1.0 * (linear_cnt - last_linear) * 1000 / duration;
+  double combine_batch_ps = 1.0 * (combine_cnt - last_combine) * 1000 / duration;
+
+
+  last_linear = linear_cnt;
+  last_combine = combine_cnt;
+
+  double linear_ps = linear_batch_ps * LINEAR_SEED_BATCH * BATCH;
+  double combine_ps = combine_batch_ps * BATCH * BATCH;
+  double dps = linear_ps + combine_ps;
+
+  float dps_balance = 1.0 * linear_cnt * LINEAR_SEED_BATCH / combine_cnt / BATCH;
+
+  std::cout << std::setprecision(2)
+            << "time: " << time(nullptr) - start_time
+            << "\tdps: " << dps << " l(" << linear_ps << ") c(" << combine_ps << ")"
+            << "\tbps: l(" << (size_t)linear_batch_ps << ") c(" << (size_t)combine_batch_ps << ")"
+            << "\tseed: set(" << seed_cnt << ") drop(" << inactive_seed_cnt << ")"
+            << "\ttask: set(" << task_cnt << ") drop(" << task_drop_cnt << ")"
+            << "\tthread: l(" << thread_linear << ") c(" << thread_combine << ")"
+            << "\tround2: " << search_round2
+            << "\tbalance: " << dps_balance
+            << endl;
 
 }
 
@@ -579,18 +630,19 @@ uint32_t seed_seek_rand(uint32_t *seed_ids, float *seed_v) {
   size_t cnt = 0;
   uint64_t id;
 
-  memset(seed_ids, 0xff, BATCH * sizeof(uint32_t));
+  memset(seed_ids, 0xff, LINEAR_SEED_BATCH * sizeof(uint32_t));
 
-  while (cnt < BATCH) {
-    if (inactive_seed_cnt < M >> 1) {
-      id = rand() % M;
-      if (id >= M) continue;
-      if (topk_que->ques[id].que_size == K) continue;
-    } else if (search_round1 < M) {
-      id = search_round1.fetch_add(1);
-      if (id >= M) continue;
-      if (topk_que->ques[id].que_size == K) continue;
-    } else if (inactive_seed_cnt < M - 100000) {
+  while (cnt < LINEAR_SEED_BATCH) {
+    // if (inactive_seed_cnt < M >> 1) {
+    //   id = rand() % M;
+    //   if (id >= M) continue;
+    //   if (topk_que->ques[id].que_size == K) continue;
+    // } else if (search_round1 < M) {
+    //   id = search_round1.fetch_add(1);
+    //   if (id >= M) continue;
+    //   if (topk_que->ques[id].que_size == K) continue;
+    // } else
+    if (inactive_seed_cnt < M - 100000) {
       id = rand() % M;
       if (id >= M) continue;
     } else if (search_round2 < M) {
@@ -613,15 +665,15 @@ uint32_t seed_seek_rand(uint32_t *seed_ids, float *seed_v) {
 }
 
 bool linear_search(float *dis_buf, const uint32_t* seed_ids, const float* seed_v, heap_t *heaps) {
-  for (uint32_t i=0; i<BATCH; i++) {
+  for (uint32_t i=0; i<LINEAR_SEED_BATCH; i++) {
     heaps[i].reinit();
   }
 
   size_t cnt = 0;
   for (uint64_t m = 0; m < BATCH_M; m += BATCH) {
-    run_batch_mm(dis_buf, seed_v, vectors + m * D);
+    run_linear_batch_mm(dis_buf, seed_v, vectors + m * D);
 
-    for (uint32_t i=0; i<BATCH; i++) {
+    for (uint32_t i=0; i<LINEAR_SEED_BATCH; i++) {
       if (seed_ids[i] == MAX_UINT32) continue;
       heaps[i].insert_batch(dis_buf + i * BATCH, m);
     }
@@ -629,13 +681,13 @@ bool linear_search(float *dis_buf, const uint32_t* seed_ids, const float* seed_v
     cnt++;
     if (cnt > 1000) {
       if (time(NULL) >= end_time) return false;
-      print_stat(cnt);
+      linear_batch_cnt.fetch_add(cnt);
       cnt = 0;
 
     }
   }
 
-  print_stat(cnt);
+  linear_batch_cnt.fetch_add(cnt);
 
   return true;
 }
@@ -651,7 +703,7 @@ void combine_search(float* dis_buf, uint32_t *ids1, float* v1, uint32_t size1, u
       cnt++;
     }
   }
-  print_stat(cnt);
+  combine_batch_cnt.fetch_add(cnt);
 }
 
 void cross_search(float* dis_buf, uint32_t *ids1, float* v1) {
@@ -664,7 +716,7 @@ void cross_search(float* dis_buf, uint32_t *ids1, float* v1) {
       cnt++;
     }
   }
-  print_stat(cnt);
+  combine_batch_cnt.fetch_add(cnt);
 }
 
 void linear_search_task(float* dis_buf, heap_t* heaps, float* seed_v, uint32_t *seed_ids) {
@@ -673,7 +725,7 @@ void linear_search_task(float* dis_buf, heap_t* heaps, float* seed_v, uint32_t *
 
   if (!linear_search(dis_buf, seed_ids, seed_v, heaps)) return;
 
-  for (int i=0; i<BATCH; i++) {
+  for (int i=0; i<LINEAR_SEED_BATCH; i++) {
     if (seed_ids[i] == MAX_UINT32) break;
 
     uint32_t* set_ids = (uint32_t*)malloc((CROSS_SIZE + COMBINE_SIZE) * sizeof(uint32_t));
@@ -693,7 +745,6 @@ void linear_search_task(float* dis_buf, heap_t* heaps, float* seed_v, uint32_t *
 
       if (j < SEED_INACTIVE_K && dis <= SEED_INACTIVE_DIS) {
         topk_que->ques[id].inactive_seed();
-        // topk_que->ques[id].disable_combine();
       }
 
     }
@@ -713,6 +764,15 @@ bool compareByValue(const std::pair<int, int>& pair1, const std::pair<int, int>&
 
 void combine_search_task(float* dis_buf, uint32_t* ids1, float* v1, uint32_t* ids2, float* v2) {
 
+  if (!topk_que->ques[ids1[0]].set_task()) {
+    task_drop_cnt++;
+    return;
+  }
+
+  for (int i=1; i<TASK_DISABLE_K; i++) {
+    topk_que->ques[ids1[i]].disable_task();
+  }
+
   for (int i=0; i<CROSS_SIZE; i++) {
     memcpy(v1 + i * D, vectors + ids1[i] * D, D * sizeof(float));
   }
@@ -728,17 +788,17 @@ void combine_search_task(float* dis_buf, uint32_t* ids1, float* v1, uint32_t* id
 void knng_task (uint32_t thread_id) {
   thread_running++;
 
-  float* seed_v = (float*)malloc(BATCH * D * sizeof(float));
-  uint32_t* seed_ids = (uint32_t*)malloc(BATCH * sizeof(uint32_t));
+  float* seed_v = (float*)malloc(LINEAR_SEED_BATCH * D * sizeof(float));
+  uint32_t* seed_ids = (uint32_t*)malloc(LINEAR_SEED_BATCH * sizeof(uint32_t));
 
-  dis_id_t *buf = (dis_id_t*)malloc((BATCH) * (CROSS_SIZE + COMBINE_SIZE) * sizeof(dis_id_t));
-  heap_t* heaps = (heap_t*)malloc((BATCH) * sizeof(heap_t));
+  dis_id_t *buf = (dis_id_t*)malloc(LINEAR_SEED_BATCH * (CROSS_SIZE + COMBINE_SIZE) * sizeof(dis_id_t));
+  heap_t* heaps = (heap_t*)malloc(LINEAR_SEED_BATCH * sizeof(heap_t));
 
   float* dis_buf = (float*)malloc(BATCH * BATCH * sizeof(float));
   float* v1 = (float*)malloc(CROSS_SIZE * D * sizeof(float));
   float* v2 = (float*)malloc(COMBINE_SIZE * D * sizeof(float));
 
-  for (uint64_t i=0; i<BATCH; i++) {
+  for (uint64_t i=0; i<LINEAR_SEED_BATCH; i++) {
     heaps[i].init(buf + i * (CROSS_SIZE + COMBINE_SIZE) , CROSS_SIZE + COMBINE_SIZE);
   }
 
@@ -769,11 +829,6 @@ void knng_task (uint32_t thread_id) {
       linear_search_task(dis_buf, heaps, seed_v, seed_ids);
       thread_linear--;
     } else {
-      if (!topk_que->ques[set_ids[0]].set_combine()) {
-        free(set_ids);
-        continue;
-      }
-
       thread_combine++;
 
       uint32_t *ids1 = set_ids;
@@ -788,17 +843,17 @@ void knng_task (uint32_t thread_id) {
   }
 
 
-  #ifdef DEBUG
-    free(dis_buf);
-    free(v1);
-    free(v2);
+#ifndef PACK
+  free(dis_buf);
+  free(v1);
+  free(v2);
 
-    free(seed_v);
-    free(seed_ids);
+  free(seed_v);
+  free(seed_ids);
 
-    free(buf);
-    free(heaps);
-  #endif
+  free(buf);
+  free(heaps);
+#endif
 
   thread_running--;
 }
@@ -839,9 +894,13 @@ int main(int argc, char* argv[]) {
     threads.emplace_back(knng_task, i);
   }
 
+  print_stat();
+  std::this_thread::sleep_for(std::chrono::seconds(3));
+
   while (time(nullptr) < end_time) {
    if (thread_running == 0) break;
-   std::this_thread::sleep_for(std::chrono::seconds(1));
+   print_stat();
+   std::this_thread::sleep_for(std::chrono::seconds(3));
   }
 
   vector<thread> dump_threads;
@@ -860,9 +919,11 @@ int main(int argc, char* argv[]) {
   }
   close(fd);
 
-  // for (int i=0; i<THREAD; i++) {
-  //   threads[i].join();
-  // }
+#ifndef PACK
+  for (int i=0; i<THREAD; i++) {
+    threads[i].join();
+  }
+#endif
 
   cout << " Rand cnt: " << rand_cnt << " rate: " << 1.0 * rand_cnt / M / K << endl;
 
@@ -873,7 +934,7 @@ int main(int argc, char* argv[]) {
   cout << "Freeing ... Time: " << time(nullptr) - start_time << endl;
 
 
-#ifdef DEBUG
+#ifndef PACK
   free(vectors);
   free(ids);
   delete topk_que;

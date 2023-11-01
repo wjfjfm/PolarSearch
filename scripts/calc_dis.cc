@@ -32,6 +32,10 @@ atomic<size_t> total_hit = 0;
 atomic<size_t> total_num = 0;
 atomic<size_t> all_hit = 0;
 
+atomic<size_t> accurate_hit = 0;
+atomic<size_t> accurate_num = 0;
+
+
 void load_knng(string path, uint32_t *knng) {
   std::ifstream ifs;
   ifs.open(path, std::ios::binary);
@@ -313,8 +317,6 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
   if (hit == 100) all_hit++;
 
 #ifdef PRINT_DETAIL
-  float recall = 1.0 * total_hit / total_num / K;
-  float all_hit_rate = 1.0 * all_hit / total_num;
 
   string color = "";
 
@@ -326,8 +328,16 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
     color = "\033[36m";
   }
 
+  if (hit >= 20) {
+    accurate_hit += hit;
+    accurate_num++;
+  }
+
+  float accurate_recall = 1.0 * accurate_hit / accurate_num / K;
+  float recall = 1.0 * total_hit / total_num / K;
+
   print_lock.lock();
-  fprintf(stdout, "Summary recall:%0.4f all_hit:%0.4f %sRecord: id:%10i hit:%3i min:%06.3f max:%06.3f detail:%s\033[0m\n", recall, all_hit_rate, color.c_str(), id, hit, min_dis, max_dis, write_buf);
+  fprintf(stdout, "recall:%0.4f acc_recal:%0.4f %sid:%7i hit:%3i min:%06.3f max:%06.3f:%s\033[0m\n", recall, accurate_recall, color.c_str(), id, hit, min_dis, max_dis, write_buf);
   print_lock.unlock();
 #endif
 
