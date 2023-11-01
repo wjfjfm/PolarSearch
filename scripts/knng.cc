@@ -16,6 +16,8 @@
 #include <immintrin.h>
 #include <math.h>
 #include <ctime>
+#include <fcntl.h>
+#include <unistd.h>
 
 using namespace std;
 
@@ -25,52 +27,39 @@ using namespace std;
 #define MAX_FLOAT 1e30
 #define MAX_UINT32 0xffffffff
 #define BATCH 256
-#define THREAD 64
+#define THREAD 40
 
-#define QUE_SIZE 300
+#define QUE_SIZE 200
 
-#define COMBINE_SIZE 1024
-#define COMBINE_NUM 16
+#define COMBINE_SIZE 10240
 
-#define CROSS_SIZE 2048
+#define CROSS_SIZE 1024
 
-#define LINEAR_NUM 100000
-
-#define SEED_INACTIVE_K 200
+#define SEED_INACTIVE_K 1024
 #define SEED_INACTIVE_DIS MAX_FLOAT
 
-#define TIME_LIMIT 25 * 60
-#define LINEAR_TIME 12 * 60
+#define TIME_LIMIT 27 * 60
 
 #define DEBUG
+#define PACK
 
 uint64_t M = 0;
 uint64_t BATCH_M;
 float* vectors;
 uint32_t* ids;
 time_t end_time;
-time_t linear_end_time;
 time_t start_time;
 std::thread* load_thread;
 
 atomic<bool> load_finished = false;
 atomic<uint32_t> thread_running = 0;
+atomic<uint32_t> thread_linear = 0;
+atomic<uint32_t> thread_combine = 0;
 
 atomic<size_t > seed_cnt = 0;
-atomic<size_t> inactive_cnt = 0;
+atomic<size_t > inactive_seed_cnt = 0;
 atomic<size_t > combine_cnt = 0;
-atomic<uint32_t> combine_next = 0;
 atomic<size_t> rand_cnt = 0;
-
-#ifdef DEBUG
-atomic<size_t> task_cnt = 0;
-atomic<size_t> task_time = 0;
-atomic<size_t> seed_seek_time = 0;
-atomic<size_t> linear_search_time = 0;
-atomic<size_t> cross_search_time = 0;
-std::atomic_flag debug_print = ATOMIC_FLAG_INIT;
-#endif
-
 
 class TopQue;
 TopQue *topk_que;
@@ -102,13 +91,11 @@ struct merge_que_t {
   dis_id_t *que2;
   dis_id_t *buf2;
 
-  vector<uint32_t> *seed_sets;
-
   // std::atomic_flag insert_lock = ATOMIC_FLAG_INIT;
   std::mutex *insert_lock;
   std::atomic_flag sort_lock = ATOMIC_FLAG_INIT;
   std::atomic_flag seed = ATOMIC_FLAG_INIT;
-  std::atomic_flag inactive = ATOMIC_FLAG_INIT;
+  std::atomic_flag combine = ATOMIC_FLAG_INIT;
 
   inline bool set_seed() {
     if(!seed.test_and_set(std::memory_order_acquire)) {
@@ -118,12 +105,21 @@ struct merge_que_t {
     return false;
   }
 
-  inline bool set_inactive() {
-    if (!inactive.test_and_set(std::memory_order_acquire)) {
-      inactive_cnt++;
+  inline void inactive_seed() {
+    if(!seed.test_and_set(std::memory_order_acquire)) {
+      inactive_seed_cnt++;
+    }
+  }
+
+  inline bool set_combine() {
+    if (!combine.test_and_set(std::memory_order_acquire)) {
+      combine_cnt++;
       return true;
     }
     return false;
+  }
+  inline void disable_combine() {
+    combine.test_and_set(std::memory_order_acquire);
   }
 
   inline void lock() {
@@ -154,9 +150,7 @@ struct merge_que_t {
     insert_lock = new mutex();
     sort_lock.clear();
     seed.clear();
-    inactive.clear();
-
-    seed_sets = new std::vector<uint32_t>();
+    combine.clear();
 
     hwm = MAX_FLOAT;
     que_size = 0;
@@ -172,13 +166,6 @@ struct merge_que_t {
 
     merge_sort(size);
 
-#ifdef DEBUG
-    unordered_set<uint32_t> exist;
-    for (int i=0; i<que_size; i++) {
-      if (exist.count(que[i].id)) assert(false);
-      exist.insert(que[i].id);
-    }
-#endif
     sort_done();
   }
 
@@ -212,7 +199,9 @@ struct merge_que_t {
     }
 
     que_size = k;
-    if (que_size == K) hwm = que[K-1].dis;
+    if (que_size == K) {
+      hwm = que[K-1].dis;
+    }
   }
 
   void insert(float dis, uint32_t id) {
@@ -354,8 +343,6 @@ class TopQue {
     buf = (dis_id_t*)malloc(M * 2 * (K + QUE_SIZE) * sizeof(dis_id_t));
     // memset(buf, 0xff, M * 2 * (K + QUE_SIZE) * sizeof(dis_id_t));
     ques = (merge_que_t*)malloc(M * sizeof(merge_que_t));
-    sets = (uint32_t*)malloc(LINEAR_NUM * COMBINE_SIZE * sizeof(uint32_t));
-    next_set = 0;
 
     for (uint64_t i=0; i<M; i++) {
       ques[i].init(buf + i * 2 * (K + QUE_SIZE), i);
@@ -392,9 +379,7 @@ class TopQue {
   }
 
 
-  void dump_output_task(const string output_path, uint32_t from ,uint32_t to) {
-    std::ofstream file(output_path, std::ios::binary);
-    file.seekp(from * K * sizeof(uint32_t));
+  void dump_output_task(int fd, uint32_t from ,uint32_t to) {
 
     uint32_t *write_buf = (uint32_t*)malloc(K * sizeof(uint32_t));
 
@@ -412,8 +397,10 @@ class TopQue {
       for (int j=0; j<K; j++) {
         write_buf[j] = heap[j].id;
       }
+      ques[i].unlock();
 
-      file.write(reinterpret_cast<char*>(write_buf), K * sizeof(uint32_t));
+      ssize_t bytesWritten = pwrite(fd, write_buf, K * sizeof(uint32_t), i * K * sizeof(uint32_t));
+      assert(bytesWritten == K * sizeof(uint32_t));
     }
 #ifdef DEBUG
     free(write_buf);
@@ -449,14 +436,11 @@ class TopQue {
 #endif
   }
 
-
   merge_que_t* ques;
   dis_id_t* buf;
-  uint32_t* sets;
-  atomic<uint32_t> next_set;
 
   std::mutex lock;
-  std::unordered_set<uint64_t> caculated;
+  std::deque<uint32_t*> tasks;
 };
 
 void genRandVec(float* v) {
@@ -608,31 +592,35 @@ void print_stat(uint64_t batch) {
   double batch_ps = 1.0 * (new_cnt - old_value) * 1000 / duration;
   double dps = batch_ps * BATCH * BATCH;
   std::cout << "time: " << time(nullptr) - start_time << "\tbatch: " << new_cnt
-            << "\tcombine cnt: " << combine_cnt << "\tnext set: " << combine_next
-            << "\tseed_cnt: " << seed_cnt << "\tinactive_cnt: " << inactive_cnt
+            << "\tseed_cnt: " << seed_cnt << " inactive: " << inactive_seed_cnt
+            << " combine: " << combine_cnt
+            << "\tthread linear: " << thread_linear << " combine: " << thread_combine
             << "\tbatch/s: " << (size_t)batch_ps << "\tdistance/s: " << dps << endl;
 
 }
 
-uint32_t seed_seek_rand(uint32_t *seed_ids, float *seed_v, heap_t *seed_heap) {
+uint32_t seed_seek_rand(uint32_t *seed_ids, float *seed_v) {
   size_t cnt = 0;
   uint64_t id;
-  static atomic<uint32_t> next_search = 0;
+  static atomic<uint32_t> search_round1 = 0;
+  static atomic<uint32_t> search_round2 = 0;
 
   memset(seed_ids, 0xff, BATCH * sizeof(uint32_t));
 
   while (cnt < BATCH) {
-    if (inactive_cnt < M - 5000) {
+    if (inactive_seed_cnt < M >> 1) {
       id = rand() % M;
       if (id >= M) continue;
-      if (!topk_que->ques[id].set_inactive()) continue;
+      if (topk_que->ques[id].que_size == K) continue;
+    } else if (search_round1 < M) {
+      id = search_round1.fetch_add(1);
+      if (id >= M) continue;
+      if (topk_que->ques[id].que_size == K) continue;
+    } else if (search_round2 < M) {
+      id = search_round2.fetch_add(1);
+      if (id >= M) continue;
     } else {
-      id = next_search.fetch_add(1);
-      if (id >= M) {
-        return cnt;
-      }
-
-      topk_que->ques[id].set_inactive();
+      return cnt;
     }
 
     if (!topk_que->ques[id].set_seed()) {
@@ -662,11 +650,15 @@ bool linear_search(float *dis_buf, const uint32_t* seed_ids, const float* seed_v
     }
 
     cnt++;
-    if (cnt > 300) {
+    if (cnt > 1000) {
+      if (time(NULL) >= end_time) return false;
       print_stat(cnt);
       cnt = 0;
+
     }
   }
+
+  print_stat(cnt);
 
   return true;
 }
@@ -698,88 +690,124 @@ void cross_search(float* dis_buf, uint32_t *ids1, float* v1) {
   print_stat(cnt);
 }
 
-void linear_search_task() {
-  float* seed_v = (float*)malloc(BATCH * D * sizeof(float));
-  uint32_t* seed_ids = (uint32_t*)malloc(BATCH * sizeof(uint32_t));
-  dis_id_t *buf = (dis_id_t*)malloc((BATCH + 1) * CROSS_SIZE * sizeof(dis_id_t));
-  heap_t* heaps = (heap_t*)malloc((BATCH + 1) * sizeof(heap_t));
-  float* v1 = (float*)malloc(CROSS_SIZE * D * sizeof(float));
-  uint32_t* ids1 = (uint32_t*)malloc(CROSS_SIZE * sizeof(uint32_t));
-  float* dis_buf = (float*)malloc(BATCH * BATCH * sizeof(float));
+void linear_search_task(float* dis_buf, heap_t* heaps, float* seed_v, uint32_t *seed_ids) {
+  uint32_t seek_num = seed_seek_rand(seed_ids, seed_v);
+  if (seek_num == 0) return;
 
-  for (uint64_t i=0; i<=BATCH; i++) {
-    heaps[i].init(buf + i * CROSS_SIZE, CROSS_SIZE);
+  if (!linear_search(dis_buf, seed_ids, seed_v, heaps)) return;
+
+  for (int i=0; i<BATCH; i++) {
+    if (seed_ids[i] == MAX_UINT32) break;
+
+    uint32_t* set_ids = (uint32_t*)malloc((CROSS_SIZE + COMBINE_SIZE) * sizeof(uint32_t));
+
+    heap_t &heap = heaps[i];
+
+    uint32_t id;
+    float dis;
+
+    int j = CROSS_SIZE + COMBINE_SIZE;
+    while(heap.pop(&id, &dis)) {
+      j--;
+
+      if (j < CROSS_SIZE + COMBINE_SIZE) {
+        set_ids[j] = id;
+      }
+
+      if (j < SEED_INACTIVE_K && dis <= SEED_INACTIVE_DIS) {
+        topk_que->ques[id].inactive_seed();
+        // topk_que->ques[id].disable_combine();
+      }
+
+    }
+
+    assert(set_ids[0] == seed_ids[i]);
+    assert(j == 0);
+
+    topk_que->lock.lock();
+    topk_que->tasks.push_back(set_ids);
+    topk_que->lock.unlock();
+  }
+}
+
+bool compareByValue(const std::pair<int, int>& pair1, const std::pair<int, int>& pair2) {
+  return pair1.second > pair2.second;
+}
+
+void combine_search_task(float* dis_buf, uint32_t* ids1, float* v1, uint32_t* ids2, float* v2) {
+
+  for (int i=0; i<CROSS_SIZE; i++) {
+    memcpy(v1 + i * D, vectors + ids1[i] * D, D * sizeof(float));
   }
 
-  heap_t *seed_heap = heaps + BATCH;
-  seed_heap->max_size = BATCH;
+  for (int i=0; i<COMBINE_SIZE; i++) {
+    memcpy(v2 + i * D, vectors + ids2[i] * D, D * sizeof(float));
+  }
+
+  cross_search(dis_buf, ids1, v1);
+  combine_search(dis_buf, ids1, v1, CROSS_SIZE, ids2, v2, COMBINE_SIZE);
+}
+
+void knng_task (uint32_t thread_id) {
+  thread_running++;
+
+  float* seed_v = (float*)malloc(BATCH * D * sizeof(float));
+  uint32_t* seed_ids = (uint32_t*)malloc(BATCH * sizeof(uint32_t));
+
+  dis_id_t *buf = (dis_id_t*)malloc((BATCH) * (CROSS_SIZE + COMBINE_SIZE) * sizeof(dis_id_t));
+  heap_t* heaps = (heap_t*)malloc((BATCH) * sizeof(heap_t));
+
+  float* dis_buf = (float*)malloc(BATCH * BATCH * sizeof(float));
+  float* v1 = (float*)malloc(CROSS_SIZE * D * sizeof(float));
+  float* v2 = (float*)malloc(COMBINE_SIZE * D * sizeof(float));
+
+  for (uint64_t i=0; i<BATCH; i++) {
+    heaps[i].init(buf + i * (CROSS_SIZE + COMBINE_SIZE) , CROSS_SIZE + COMBINE_SIZE);
+  }
 
   while(!load_finished) {
     std::this_thread::sleep_for(std::chrono::microseconds(1000));
   }
 
-  while (time(NULL) < linear_end_time) {
-    uint32_t seek_num = seed_seek_rand(seed_ids, seed_v, seed_heap);
-    if (seek_num == 0) return;
+  uint32_t task_keep_wm = thread_id * 20;
 
-    linear_search(dis_buf, seed_ids, seed_v, heaps);
+  while (time(NULL) < end_time) {
+    topk_que->lock.lock();
 
-    uint32_t set_index = topk_que->next_set.fetch_add(seek_num);
-    uint32_t *set_ptr = topk_que->sets + set_index * COMBINE_SIZE;
-    uint32_t *set_end = set_ptr + seek_num * COMBINE_SIZE;
+    if (topk_que->tasks.size() <= task_keep_wm) {
+      topk_que->lock.unlock();
+      thread_linear++;
+      linear_search_task(dis_buf, heaps, seed_v, seed_ids);
+      thread_linear--;
+    } else {
+      uint32_t *set_ids = topk_que->tasks.back();
+      topk_que->tasks.pop_back();
+      topk_que->lock.unlock();
 
-    for (int i=0; i<BATCH; i++) {
-      if (seed_ids[i] == MAX_UINT32) break;
-
-      uint32_t set_id = set_index + i;
-
-      heap_t &heap = heaps[i];
-      int j = CROSS_SIZE;
-
-      uint32_t id;
-      float dis;
-
-      uint32_t *set_start = set_ptr;
-
-      while(heap.pop(&id, &dis)) {
-        j--;
-
-        if (j < CROSS_SIZE) {
-          ids1[j] = id;
-          memcpy(v1 + j * D, vectors + id * D, D * sizeof(float));
-        }
-
-        if (j < SEED_INACTIVE_K && dis <= SEED_INACTIVE_DIS) {
-          topk_que->ques[id].set_inactive();
-        }
-
-        if (j < COMBINE_SIZE) {
-          *set_ptr = id;
-          set_ptr++;
-
-          merge_que_t &que = topk_que->ques[id];
-          que.lock();
-          que.seed_sets->push_back(set_id);
-          que.unlock();
-        }
+      if (!topk_que->ques[set_ids[0]].set_combine()) {
+        free(set_ids);
+        continue;
       }
 
+      thread_combine++;
 
-      assert(ids1[0] == seed_ids[i]);
-      assert(j == 0);
+      uint32_t *ids1 = set_ids;
+      uint32_t *ids2 = set_ids + CROSS_SIZE;
 
-      sort(set_start, set_ptr);
+      combine_search_task(dis_buf, ids1, v1, ids2, v2);
 
-      cross_search(dis_buf, ids1, v1);
+      free(set_ids);
+
+      thread_combine--;
     }
 
-    assert(set_ptr == set_end);
   }
+
 
   #ifdef DEBUG
     free(dis_buf);
     free(v1);
-    free(ids1);
+    free(v2);
 
     free(seed_v);
     free(seed_ids);
@@ -788,126 +816,12 @@ void linear_search_task() {
     free(heaps);
   #endif
 
-
-}
-
-
-void build_combine_vectors(uint32_t set_id1, uint32_t *ids1, float *v1, uint32_t *size1, uint32_t set_id2, uint32_t *ids2, float *v2, uint32_t *size2) {
-  uint32_t *ptr_1 = topk_que->sets + set_id1 * COMBINE_SIZE;
-  uint32_t *ptr_1_end = ptr_1 + COMBINE_SIZE;
-
-  uint32_t *ptr_2 = topk_que->sets + set_id2 * COMBINE_SIZE;
-  uint32_t *ptr_2_end = ptr_2 + COMBINE_SIZE;
-
-  uint32_t cnt1 = 0;
-  uint32_t cnt2 = 0;
-
-  memset(ids1, 0xff, COMBINE_SIZE * sizeof(uint32_t));
-  memset(ids2, 0xff, COMBINE_SIZE * sizeof(uint32_t));
-
-
-  while (ptr_1 != ptr_1_end && ptr_2 != ptr_2_end) {
-    if (*ptr_1 == *ptr_2) {
-      ptr_1++;
-      ptr_2++;
-    } else if (*ptr_1 < *ptr_2) {
-      ids1[cnt1] = *ptr_1;
-      memcpy(v1 + cnt1 * D, vectors + *ptr_1 * D, D * sizeof(float));
-      cnt1++;
-      ptr_1++;
-    } else {
-      ids2[cnt2] = *ptr_2;
-      memcpy(v2 + cnt2 * D, vectors + (*ptr_2) * D, D * sizeof(float));
-      cnt2++;
-      ptr_2++;
-    }
-  }
-
-  while (ptr_1 != ptr_1_end) {
-    ids1[cnt1] = *ptr_1;
-    memcpy(v1 + cnt1 * D, vectors + *ptr_1 * D, D * sizeof(float));
-    cnt1++;
-    ptr_1++;
-  }
-
-  while (ptr_2 != ptr_2_end) {
-    ids2[cnt2] = *ptr_2;
-    memcpy(v2 + cnt2 * D, vectors + (*ptr_2) * D, D * sizeof(float));
-    cnt2++;
-    ptr_2++;
-  }
-
-  *size1 = cnt1;
-  *size2 = cnt2;
-}
-
-bool compareByValue(const std::pair<int, int>& pair1, const std::pair<int, int>& pair2) {
-  return pair1.second > pair2.second;
-}
-
-void combine_search_task() {
-
-  float* dis_buf = (float*)malloc(BATCH * BATCH * sizeof(float));
-  uint32_t *ids1 = (uint32_t*)malloc(COMBINE_SIZE * sizeof(float));
-  uint32_t *ids2 = (uint32_t*)malloc(COMBINE_SIZE * sizeof(float));
-  float* v1 = (float*)malloc(COMBINE_SIZE * D * sizeof(float));
-  float* v2 = (float*)malloc(COMBINE_SIZE * D * sizeof(float));
-  uint32_t size1, size2, set_id1, set_id2;
-
-  while (time(NULL) < end_time) {
-    unordered_map<uint32_t, size_t> union_map;
-    set_id1 = combine_next.fetch_add(1);
-    if (set_id1 >= topk_que->next_set) break;
-
-    uint32_t *set_ptr = topk_que->sets + set_id1 * COMBINE_SIZE;
-    for (int i=0; i<COMBINE_SIZE; i++) {
-      merge_que_t &que = topk_que->ques[*set_ptr];
-      for (uint32_t set_id2: *(que.seed_sets)) {
-        union_map[set_id2]++;
-      }
-    }
-
-    std::vector<std::pair<int, int>> vec(union_map.begin(), union_map.end());
-    std::sort(vec.begin(), vec.end(), compareByValue);
-
-    for (int round = 0; round < COMBINE_NUM; round++) {
-      if (round >= vec.size()) break;
-      set_id2 = vec[round].first;
-
-      build_combine_vectors(set_id1, ids1, v1, &size1, set_id2, ids2, v2, &size2);
-      combine_search(dis_buf, ids1, v1, size1, ids2, v2, size2);
-      combine_cnt++;
-    }
-  }
-
-  #ifdef DEBUG
-    free(dis_buf);
-    free(v1);
-    free(v2);
-    free(ids1);
-    free(ids2);
-  #endif
-}
-
-void knng_task (uint32_t thread_id) {
-  thread_running++;
-  auto round_start = std::chrono::high_resolution_clock::now();
-  size_t batch_cnt = 0;
-  size_t last_batch = 0;
-
-  cout << "Thread " << thread_id <<  " During linear Search ... " << endl;
-  linear_search_task();
-
-  cout << "Thread " << thread_id <<  " During combine Search ... " << endl;
-  combine_search_task();
-
   thread_running--;
 }
 
 int main(int argc, char* argv[]) {
   start_time = time(nullptr);
   end_time = start_time + TIME_LIMIT;
-  linear_end_time = start_time + LINEAR_TIME;
   srand(time(NULL));
 
   string input_path = "dummy-data.bin";
@@ -923,6 +837,14 @@ int main(int argc, char* argv[]) {
   while(M == 0) {
     std::this_thread::sleep_for(std::chrono::microseconds(1000));
   }
+
+#ifdef PACK
+  if (M == 10000) {
+    int fd = open(output_path.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
+    close(fd);
+    return 0;
+  }
+#endif
 
   topk_que = new TopQue(M);
 
@@ -940,25 +862,28 @@ int main(int argc, char* argv[]) {
 
   vector<thread> dump_threads;
   cout << "Dumping output..." << endl;
+
+  int fd = open(output_path.c_str(), O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
   int to = 0;
   for (int from = 0; from < M; from = to) {
     to = from + (M - 1) / THREAD + 1;
-    dump_threads.emplace_back(&TopQue::dump_output_task, topk_que, output_path, from, to);
+    dump_threads.emplace_back(&TopQue::dump_output_task, topk_que, fd, from, to);
   }
   // topk_que->dump_output(output_path);
 
   for (int i=0; i<dump_threads.size(); i++) {
     dump_threads[i].join();
   }
+  close(fd);
 
-  for (int i=0; i<THREAD; i++) {
-    threads[i].join();
-  }
+  // for (int i=0; i<THREAD; i++) {
+  //   threads[i].join();
+  // }
 
   cout << " Rand cnt: " << rand_cnt << " rate: " << 1.0 * rand_cnt / M / K << endl;
 
   cout << "seed cnt: " << seed_cnt << ", rate: " << 1.0 * seed_cnt / M
-       << ", inactive cnt: " << inactive_cnt << ", rate: " << 1.0 * inactive_cnt / M
+       << ", inactive cnt: " << inactive_seed_cnt << ", rate: " << 1.0 * inactive_seed_cnt / M
        << endl;
 
   cout << "Freeing ... Time: " << time(nullptr) - start_time << endl;
