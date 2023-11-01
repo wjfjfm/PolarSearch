@@ -278,8 +278,6 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
   float dis;
 
 #ifdef PRINT_DETAIL
-  uint32_t total_id_diff = 0;
-  float avg_id_diff = 0;
   float max_dis, min_dis;
 #endif
 
@@ -304,7 +302,6 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 #ifdef PRINT_DETAIL
     if (pos == K-1) max_dis = dis;
     else if (pos == 0) min_dis = dis;
-    total_id_diff += rid > id ? rid - id : id - rid;
 
 #endif
     pos--;
@@ -316,7 +313,6 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
   if (hit == 100) all_hit++;
 
 #ifdef PRINT_DETAIL
-  avg_id_diff = (double)total_id_diff / K;
   float recall = 1.0 * total_hit / total_num / K;
   float all_hit_rate = 1.0 * all_hit / total_num;
 
@@ -331,7 +327,7 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
   }
 
   print_lock.lock();
-  fprintf(stdout, "Summary recall:%0.4f all_hit:%0.4f %sRecord: id:%10i hit:%3i min:%06.3f max:%06.3f id diff:%08f detail:%s\033[0m\n", recall, all_hit_rate, color.c_str(), id, hit, min_dis, max_dis, avg_id_diff, write_buf);
+  fprintf(stdout, "Summary recall:%0.4f all_hit:%0.4f %sRecord: id:%10i hit:%3i min:%06.3f max:%06.3f detail:%s\033[0m\n", recall, all_hit_rate, color.c_str(), id, hit, min_dis, max_dis, write_buf);
   print_lock.unlock();
 #endif
 
