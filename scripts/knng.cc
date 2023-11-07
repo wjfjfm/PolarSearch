@@ -1,3 +1,4 @@
+#include <csignal>
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -33,19 +34,18 @@ using namespace std;
 #define LINEAR_SEED_BATCH (1 * BATCH)
 #define LINEAR_VECT_BATCH (32 * BATCH)
 
-#define MAX_SEED_NUM (100 * LINEAR_SEED_BATCH)
-#define HEAP_SIZE 100
+#define MAX_SEED_NUM (400 * LINEAR_SEED_BATCH)
+#define HEAP_SIZE 256
 
-#define HEAP_CUT_THD (20 * BATCH)
-#define TARGET_INCNT_RATE 4
+#define HEAP_CUT_THD (40 * BATCH)
+#define TARGET_INCNT 100000
 #define SEED_SEEK_DEPTH 100000
 
-#define TIME_END 60 * 60
+#define TIME_END 29 * 60 - 30
 
-
-// #define PACK
+#define PACK
 #define NO_FREE
-#define DEBUG
+// #define DEBUG
 
 uint64_t M = 0;
 uint64_t BATCH_M = 0;
@@ -86,6 +86,20 @@ atomic<size_t> linear_batch_cnt = 0;
 atomic<size_t> combine_batch_cnt = 0;
 atomic<size_t > seed_cnt = 0;
 atomic<size_t > task_cnt = 0;
+double avg_incnt = 0;
+
+uint32_t max_incnt_id = MAX_UINT32;
+uint32_t max_incnt = 0;
+
+// 信号处理函数
+void signalHandler(int signal) {
+  static int cnt = 0;
+  std::cout << "Received signal: " << signal << std::endl;
+  end_time = 0;
+  cnt++;
+
+  if (cnt > 3) exit(0);
+}
 
 struct task_t {
   uint32_t *clus_ids;
@@ -314,7 +328,7 @@ struct node_t {
 
       heap.insert(dis, id2);
 
-      if (dis < _min_dis) {
+      if (dis < min_dis && dis < _min_dis) {
         _min_dis = dis;
         _min_id = id2;
       }
@@ -332,7 +346,6 @@ struct node_t {
 };
 
 void dump_output_task(int fd, uint32_t from ,uint32_t to) {
-  cout << "Debug dump from: " << from << " to: " << to << endl;
   assert(from % 1024 == 0);
 
   const size_t buf_size = 1024;
@@ -573,6 +586,21 @@ void print_stat() {
 
   float dps_balance = 1.0 * linear_cnt / (linear_cnt + combine_cnt * BATCH);
 
+  uint64_t total_incnt = 0;
+
+  for (int i=0; i<seed_cnt; i++) {
+    Seed &seed = seeds[i];
+    uint64_t incnt = nodes[seed.id].in_cnt;
+    total_incnt += incnt * incnt;
+
+    if (incnt > max_incnt || seed.id == max_incnt_id) {
+      max_incnt = incnt;
+      max_incnt_id = seed.id;
+    }
+  }
+
+  avg_incnt = 1.0 * total_incnt / M;
+
   std::cout << std::setprecision(2)
             << "time: " << time(nullptr) - start_time
             << "\tdps: " << dps << " l(" << linear_ps << ") c(" << combine_ps << ")"
@@ -580,6 +608,7 @@ void print_stat() {
             << "\tseed: set(" << seed_cnt << ")"
             << "\tround: linear(" << linear_vec_batch << ") build(" << build_combine_round << ")"
             << "\ttask: cnt(" << task_cnt << ") round(" << combine_search_round << ")"
+            << "\tincnt avg(" << avg_incnt << ") max(" << max_incnt << ") max_id(" << max_incnt_id << ")"
             << endl;
 }
 
@@ -596,6 +625,7 @@ void seed_seek_rand(uint32_t target_seed_cnt) {
       max_id = MAX_UINT32;
       max_incnt = 0;
       uint32_t seed_id = nodes[id].set_seed();
+      cout << "Debug rand over" << endl;
       continue;
     }
 
@@ -608,14 +638,14 @@ void seed_seek_rand(uint32_t target_seed_cnt) {
         max_id = id;
       }
 
-      if (nodes[min_id].in_cnt < (M / seed_cnt) * TARGET_INCNT_RATE) continue;
+      if (nodes[min_id].in_cnt < avg_incnt) continue;
     }
     uint32_t seed_id = nodes[id].set_seed();
   }
 }
 
 bool compareTask(const task_t &A, const task_t &B) {
-  return A.size_h * A.size_c > B.size_h * B.size_c;
+  return (uint64_t)A.size_h * A.size_c < (uint64_t)B.size_h * B.size_c;
 }
 
 void build_combine_relations() {
@@ -709,7 +739,7 @@ class KNNG {
 
   void linear_search() {
     uint32_t last_round = MAX_UINT32;
-    uint32_t vec_batch = linear_vec_batch.fetch_add(LINEAR_VECT_BATCH);
+    uint64_t vec_batch = linear_vec_batch.fetch_add(LINEAR_VECT_BATCH);
 
     while (true) {
       uint32_t new_round = vec_batch / BATCH_M;
@@ -772,6 +802,7 @@ class KNNG {
 
 
         uint32_t task_id = task_cnt.fetch_add(1);
+        tasks.emplace_back();
         task_t &task = tasks[task_id];
         task.clus_ids = seed.cluster_ids.data();
         task.size_c = seed.cluster_ids.size();
@@ -874,6 +905,9 @@ class KNNG {
 };
 
 int main(int argc, char* argv[]) {
+
+  signal(SIGINT, signalHandler);
+
   start_time = time(nullptr);
   end_time = start_time + TIME_END;
 
