@@ -30,18 +30,25 @@ using namespace std;
 
 #define THREAD 32
 
-#define LINEAR_SEED_BATCH (4 * BATCH)
 #define LINEAR_VECT_BATCH (32 * BATCH)
 
-#define MAX_SEED_NUM (50 * LINEAR_SEED_BATCH)
-#define HEAP_SIZE 10
+#define MAX_SEED_NUM 150000
+#define HEAP_SIZE 256
 
-#define TARGET_INCNT 500
+#define HEAP_CUT_THD (100 * BATCH)
+#define TARGET_INCNT_RATE 10
+#define SEED_SEEK_DEPTH 100000
 
-#define TIME_END 10 * 60
+#define TIME_END 30 * 60
+#define TIME_LINEAR 10 * 60
+
+#define TIME_WARMUP 0
+#define TIME_LINEAR_RESERVE 90
+#define WARMUP_SEED_BATCH 64
 
 // #define PACK
 #define NO_FREE
+#define DEBUG
 
 uint64_t M = 0;
 uint64_t BATCH_M = 0;
@@ -56,7 +63,7 @@ uint32_t* ids;
 node_t* nodes;
 uint32_t* buf;
 Seed *seeds;
-task_t *tasks;
+vector<task_t> tasks;
 atomic_flag *locks;
 
 atomic<uint64_t> linear_vec_batch = 0;
@@ -66,6 +73,7 @@ atomic<uint32_t> combine_search_round = 0;
 
 time_t start_time;
 time_t end_time;
+time_t linear_time;
 
 mutex print_lock;
 bool printed = false;
@@ -136,8 +144,8 @@ struct heap_t {
   dis_id_t *heap;
   uint32_t max_size;
 
-  void init(dis_id_t* _heap, uint32_t _max_size) {
-    heap = _heap;
+  void init(uint32_t _max_size) {
+    heap = (dis_id_t*)malloc(_max_size * sizeof(dis_id_t));
     max_size = _max_size;
 
     heap[0].dis = MAX_FLOAT;
@@ -152,9 +160,18 @@ struct heap_t {
     while (size > new_size) {
       pop(&id, &dis);
     }
-
     heap_top = heap[0].dis;
     max_size = new_size;
+
+    dis_id_t *new_heap = (dis_id_t*)malloc(new_size * sizeof(dis_id_t));
+    memcpy(new_heap, heap, size * sizeof(dis_id_t));
+    free(heap);
+
+    heap = new_heap;
+  }
+
+  void uninit() {
+    free(heap);
   }
 
   inline void heap_down(uint32_t index) {
@@ -203,11 +220,6 @@ struct heap_t {
       return;
     }
 
-    if (size >= max_size) {
-      cout << "Debug: size: " << size << endl;
-      assert(false);
-    }
-
     heap[size].dis = dis;
     heap[size].id = id;
     heap_up(size);
@@ -246,8 +258,8 @@ struct node_t {
   std::atomic_flag insert_lock = ATOMIC_FLAG_INIT;
   std::atomic_flag seeded = ATOMIC_FLAG_INIT;
 
-  void init(dis_id_t* _heap, uint32_t _max_size, uint32_t _id) {
-    heap.init(_heap, _max_size);
+  void init(uint32_t _max_size, uint32_t _id) {
+    heap.init(_max_size);
 
     id = _id;
     seed_id = MAX_UINT32;
@@ -272,12 +284,7 @@ struct node_t {
   inline uint32_t set_seed() {
     if (!seeded.test_and_set(std::memory_order_acquire)) {
       seed_id = seed_cnt.fetch_add(1);
-
-      if (seed_id >= MAX_SEED_NUM) {
-        seed_cnt.store(MAX_SEED_NUM);
-        seeded.clear();
-        return MAX_UINT32;
-      }
+      assert(seed_id < MAX_SEED_NUM);
 
       seeds[seed_id].set(id, seed_id);
       return seed_id;
@@ -296,7 +303,17 @@ struct node_t {
     unlock();
   }
 
+  void insert_batch_seed(const float* dis_buf, const uint32_t id, uint32_t num) {
+    for (uint32_t j=0; j<num; j++) {
+      const uint32_t id2 = id + j;
+      if (id2 == id) continue;
+      heap.insert(dis_buf[j], id2);
+    }
+  }
+
   void insert_batch_linear(const float* dis_buf, const uint32_t *ids, uint32_t num) {
+    if (seed_id != MAX_UINT32) return;
+
     float _min_dis = MAX_FLOAT;
     uint32_t _min_id = MAX_UINT32;
     for (uint32_t j=0; j<num; j++) {
@@ -306,14 +323,13 @@ struct node_t {
 
       heap.insert(dis, id2);
 
-      if (dis < _min_dis) {
+      if (dis < min_dis && dis < _min_dis) {
         _min_dis = dis;
         _min_id = id2;
       }
     }
 
     if (_min_dis < min_dis) {
-
       if (min_id != MAX_UINT32) nodes[min_id].in_cnt--;
       nodes[_min_id].in_cnt++;
       min_dis = _min_dis;
@@ -324,7 +340,6 @@ struct node_t {
 };
 
 void dump_output_task(int fd, uint32_t from ,uint32_t to) {
-  cout << "Debug dump from: " << from << " to: " << to << endl;
   assert(from % 1024 == 0);
 
   const size_t buf_size = 1024;
@@ -385,53 +400,6 @@ float l2_dis_mm(const float* v1, const float* v2) {
   return _mm512_reduce_add_ps(sum);
 }
 
-void run_linear_batch_mm(float* distances, const float* v1, const float* v2, uint32_t size) {
-  int i, j, k, l, m, n;
-  __m512 diff, square;
-  __m512 va;
-  __m512 vb[16];
-  __m512 sum[256];
-
-  for (int i = 0; i < size * D; i += 16) {
-    _mm_prefetch(reinterpret_cast<const char*>(v1 + i), _MM_HINT_T0);
-  }
-
-  for (int i = 0; i < BATCH * D; i += 16) {
-    _mm_prefetch(reinterpret_cast<const char*>(v2 + i), _MM_HINT_T0);
-  }
-
-  for (i = 0; i < size; i += 16) {
-    for (j = 0; j < BATCH; j += 16) {
-      for (l = 0; l < 256; l++) {
-        sum[l] = _mm512_setzero_ps();
-      }
-
-      for (k = 0; k < D; k += 16) {
-        for (n = 0; n < 16; n++) {
-          vb[n] = _mm512_loadu_ps(v2 + (j + n) * D + k);
-        }
-
-        l = 0;
-        for (m = 0; m < 16; m++) {
-          va = _mm512_loadu_ps(v1 + (i + m) * D + k);
-          for (n = 0; n < 16; n++) {
-            diff = _mm512_sub_ps(va, vb[n]);
-            sum[l] = _mm512_fmadd_ps(diff, diff, sum[l]);
-            l++;
-          }
-        }
-      }
-
-      l = 0;
-      for (m = 0; m < 16; m++) {
-        for (n = 0; n < 16; n++) {
-          distances[(i + m) * BATCH + j + n] = _mm512_reduce_add_ps(sum[l]);
-          l++;
-        }
-      }
-    }
-  }
-}
 
 void run_vp_batch_mm(float* distances, uint32_t* const idsA, uint32_t* const idsB, uint32_t sizeA, uint32_t sizeB) {
   int i, j, k, l, m, n;
@@ -583,8 +551,8 @@ void read_from_file(string input_path) {
 void print_setting() {
   cout << "Settings: "
        << " THREAD " << THREAD << endl
-       << " LINEAR_SEED_BATCH " << LINEAR_SEED_BATCH << endl
        << " LINEAR_VECT_BATCH " << LINEAR_VECT_BATCH << endl
+       << " HEAP_SIZE " << HEAP_SIZE << endl
        << " MAX_SEED_NUM " << MAX_SEED_NUM << endl;
 }
 void print_stat() {
@@ -599,7 +567,7 @@ void print_stat() {
   size_t linear_cnt = linear_batch_cnt;
   size_t combine_cnt = combine_batch_cnt;
 
-  double linear_batch_ps = 1.0 * (linear_cnt - last_linear) * 1000 / duration;
+  double linear_batch_ps = 1.0 * (linear_cnt - last_linear) * 1000 / duration / BATCH;
   double combine_batch_ps = 1.0 * (combine_cnt - last_combine) * 1000 / duration;
 
 
@@ -612,26 +580,71 @@ void print_stat() {
 
   float dps_balance = 1.0 * linear_cnt / (linear_cnt + combine_cnt * BATCH);
 
+  uint64_t total_incnt = 0;
+  double avg_incnt = 0;
+  #ifdef DEBUG
+  for (int i=0; i<M; i++) {
+    if (nodes[i].min_id != MAX_UINT32) {
+      total_incnt += nodes[nodes[i].min_id].in_cnt;
+    }
+  }
+  avg_incnt = 1.0 * total_incnt / M;
+  #endif
+
   std::cout << std::setprecision(2)
             << "time: " << time(nullptr) - start_time
             << "\tdps: " << dps << " l(" << linear_ps << ") c(" << combine_ps << ")"
             << "\tbatch: l(" << linear_cnt  << ") c(" << combine_cnt << ") l/c(" << 1.0 * linear_cnt / combine_cnt << ")"
             << "\tseed: set(" << seed_cnt << ")"
-            << "\tround: linear(" << linear_vec_batch << ") build(" << build_combine_round << ") combine(" << combine_search_round << ")"
+            << "\tround: linear(" << linear_vec_batch << ") build(" << build_combine_round << ")"
+            << "\ttask: cnt(" << task_cnt << ") round(" << combine_search_round << ")"
+            << "\tincnt(" << avg_incnt << ")"
             << endl;
 }
 
-void seed_seek_rand(uint32_t target_seed_cnt) {
-  while (seed_cnt < target_seed_cnt) {
-    const uint64_t id = rand() % M;
+void seed_seek_rand(uint32_t *seed_ids, uint32_t seed_num) {
+  uint32_t max_id = MAX_UINT32;
+  uint32_t max_incnt = 0;
+  uint32_t seek_depth = 0;
 
+  uint32_t cnt = 0;
+
+  while (cnt < seed_num) {
+    uint64_t id;
+    if (seek_depth > SEED_SEEK_DEPTH) {
+      id = max_id;
+      seek_depth = 0;
+      max_id = MAX_UINT32;
+      max_incnt = 0;
+      uint32_t seed_id = nodes[id].set_seed();
+      if (seed_id != MAX_UINT32) {
+        cout << "Debug: seed over depth" << endl;
+        seed_ids[cnt] = id;
+        cnt++;
+      }
+      continue;
+    }
+
+    id = rand() % M;
+    seek_depth++;
     const uint32_t min_id = nodes[id].min_id;
     if (min_id != MAX_UINT32) {
-      if (nodes[min_id].in_cnt < TARGET_INCNT) continue;
+      node_t &father = nodes[min_id];
+      if (father.in_cnt > max_incnt) {
+        max_incnt = father.in_cnt;
+        max_id = id;
+      }
+
+      if (father.in_cnt < (M / seed_cnt) * TARGET_INCNT_RATE) continue;
+
+      id = father.heap.heap[rand() % father.heap.size].id;
     }
 
     uint32_t seed_id = nodes[id].set_seed();
-    if (seed_id == MAX_UINT32) continue;
+    if (seed_id != MAX_UINT32) {
+      seed_ids[cnt] = id;
+      cnt++;
+    }
   }
 }
 
@@ -643,23 +656,22 @@ void build_combine_relations() {
   uint32_t id = build_combine_round.fetch_add(1);
   while (id < M) {
     node_t &node = nodes[id];
-    for (int i=0; i<HEAP_SIZE; i++) {
-      const uint32_t node_id = node.heap.heap[i].id;
-      assert(node_id != MAX_UINT32);
-      Seed &seed = seeds[nodes[node_id].seed_id];
+
+    if (node.seed_id == MAX_UINT32) {
+      for (int i=0; i<HEAP_SIZE; i++) {
+        const uint32_t node_id = node.heap.heap[i].id;
+        assert(node_id != MAX_UINT32);
+        Seed &seed = seeds[nodes[node_id].seed_id];
+        seed.lock();
+        seed.heap_ids.push_back(id);
+        seed.unlock();
+      }
+
+      Seed &seed = seeds[nodes[node.min_id].seed_id];
       seed.lock();
-      seed.heap_ids.push_back(id);
+      seed.cluster_ids.push_back(id);
       seed.unlock();
     }
-
-    Seed &seed = seeds[nodes[node.min_id].seed_id];
-    seed.lock();
-    if (node.seed_id != MAX_UINT32) {
-      seed.heap_ids.push_back(id);
-    } else {
-      seed.cluster_ids.push_back(id);
-    }
-    seed.unlock();
 
     node.heap.resize(K);
 
@@ -670,32 +682,22 @@ void build_combine_relations() {
 class KNNG {
  public:
   float* dis_buf;
-  float* dis_ptr;
   uint32_t thread_id;
   uint32_t* seed_ids;
+  bool *visited;
 
   KNNG(uint32_t _thread_id) {
     thread_id = _thread_id;
-    dis_ptr = (float*)malloc(LINEAR_SEED_BATCH * BATCH * sizeof(float) + 64);
-    dis_buf = (float*)(((uint64_t)dis_ptr + 64) & ~0x3f);
-    seed_ids = (uint32_t*)malloc(LINEAR_SEED_BATCH * sizeof(uint32_t));
+    dis_buf = (float*)aligned_alloc(64, BATCH * BATCH * sizeof(float));
+    seed_ids = (uint32_t*)aligned_alloc(64, BATCH * sizeof(uint32_t));
+    visited = (bool*)malloc(BATCH_M / LINEAR_VECT_BATCH * sizeof(bool));
   }
 
   ~KNNG() {
 #ifndef NO_FREE
-    free(dis_ptr);
+    free(dis_buf);
     free(seed_ids);
 #endif
-  }
-
-  void load_seed_ids(uint32_t from_seed_id) {
-    seed_seek_rand(from_seed_id + LINEAR_SEED_BATCH);
-    for (int i=0; i<LINEAR_SEED_BATCH; i++) {
-      while (seeds[from_seed_id + i].id == MAX_UINT32) {
-        cout << "Debug load seed MAX" << endl;
-      }
-      seed_ids[i] = seeds[from_seed_id + i].id;
-    }
   }
 
   void combine_search() {
@@ -723,53 +725,58 @@ class KNNG {
     }
   }
 
-  void linear_search() {
-    uint32_t last_round = MAX_UINT32;
-    uint32_t vec_batch = linear_vec_batch.fetch_add(LINEAR_VECT_BATCH);
+  void linear_search(uint32_t seed_num) {
+    seed_seek_rand(seed_ids, seed_num);
 
-    while (true) {
-      uint32_t new_round = vec_batch / BATCH_M;
-      if (new_round * LINEAR_SEED_BATCH >=  MAX_SEED_NUM) break;
+    for (int i=0; i<seed_num; i++) {
+      for (int j=0; j<D; j+=16) {
+        _mm_prefetch(reinterpret_cast<const char*>(vectors + seed_ids[i] * D + j), _MM_HINT_T1);
+      }
+    }
 
-      uint32_t m_from = vec_batch % BATCH_M;
+    bool skipped = true;
+    memset(visited, 0, BATCH_M / LINEAR_VECT_BATCH * sizeof(bool));
 
-      // while (locks[m_from / LINEAR_VECT_BATCH].test_and_set()) {}
+    while (skipped) {
+      skipped = false;
 
-      if (new_round != last_round) {
-        load_seed_ids(new_round * LINEAR_SEED_BATCH);
-        last_round = new_round;
-        for (int i=0; i<LINEAR_SEED_BATCH; i++) {
+      for (int m_from = 0; m_from < BATCH_M; m_from += LINEAR_VECT_BATCH) {
+        const uint32_t lock_id = m_from / LINEAR_VECT_BATCH;
+        if (visited[lock_id]) continue;
+
+        if (locks[lock_id].test_and_set()) {
+          skipped = true;
+          continue;
+        }
+
+        visited[lock_id] = true;
+
+        for (int i=0; i<LINEAR_VECT_BATCH; i++) {
           for (int j=0; j<D; j+=16) {
-            _mm_prefetch(reinterpret_cast<const char*>(vectors + seed_ids[i] * D + j), _MM_HINT_T1);
+            _mm_prefetch(reinterpret_cast<const char*>(vectors + (i + m_from) * D + j), _MM_HINT_T1);
           }
         }
-      }
 
-      for (int i=0; i<LINEAR_VECT_BATCH; i++) {
-        for (int j=0; j<D; j+=16) {
-          _mm_prefetch(reinterpret_cast<const char*>(vectors + (i + m_from) * D + j), _MM_HINT_T1);
-        }
-      }
+        for (uint32_t m = m_from; (m < m_from + LINEAR_VECT_BATCH) && m < M; m += BATCH) {
+          const uint32_t size_v = m + BATCH > M ? M - m : BATCH;
 
-      for (uint32_t m = m_from; (m < m_from + LINEAR_VECT_BATCH) && m < M; m += BATCH) {
-        const uint32_t size_v = m + BATCH > M ? M - m : BATCH;
+          run_vp_batch_mm(dis_buf , seed_ids, ids + m, seed_num, size_v);
 
-        for (int n=0; n<LINEAR_SEED_BATCH; n += BATCH) {
-          run_vp_batch_mm(dis_buf + n * BATCH, seed_ids + n, ids + m, BATCH, size_v);
-        }
+          for (int i=0; i<size_v; i++) {
+            const uint32_t id = m + i;
+            nodes[id].insert_batch_linear(dis_buf + i, seed_ids, seed_num);
+          }
 
-        linear_batch_cnt.fetch_add(LINEAR_SEED_BATCH / BATCH);
+          for (int i=0; i<seed_num; i++) {
+            nodes[seed_ids[i]].insert_batch_seed(dis_buf + i * BATCH, m, size_v);
+          }
 
-        for (int i=0; i<size_v; i++) {
-          const uint32_t id = m + i;
-          nodes[id].insert_batch_linear(dis_buf + i, seed_ids, LINEAR_SEED_BATCH);
+          linear_batch_cnt.fetch_add(seed_num);
         }
 
+
+        locks[lock_id].clear();
       }
-
-      // locks[m_from / LINEAR_VECT_BATCH].clear();
-
-      vec_batch = linear_vec_batch.fetch_add(LINEAR_VECT_BATCH);
     }
   }
 
@@ -783,17 +790,28 @@ class KNNG {
       if (seed.cluster_ids.size() == 0) continue;
       if (seed.heap_ids.size() == 0) continue;
 
-      uint32_t task_id = task_cnt.fetch_add(1);
+      for (int i=0; i<seed.heap_ids.size(); i+=HEAP_CUT_THD) {
+        uint32_t size = seed.heap_ids.size() - i > HEAP_CUT_THD ? HEAP_CUT_THD : seed.heap_ids.size() - i;
 
-      task_t &task = tasks[task_id];
-      task.clus_ids = seed.cluster_ids.data();
-      task.size_c = seed.cluster_ids.size();
 
-      task.heap_ids = seed.heap_ids.data();
-      task.size_h = seed.heap_ids.size();
+        tasks.emplace_back();
+        uint32_t task_id = task_cnt.fetch_add(1);
+        task_t &task = tasks[task_id];
+        task.clus_ids = seed.cluster_ids.data();
+        task.size_c = seed.cluster_ids.size();
+
+        task.heap_ids = seed.heap_ids.data() + i;
+        task.size_h = size;
+      }
     }
 
-    sort(tasks, tasks + task_cnt, compareTask);
+    sort(tasks.data(), tasks.data() + task_cnt, compareTask);
+
+#ifdef DEBUG
+    for (int i=0; i<task_cnt; i++) {
+      cout << tasks[i].size_h << "x" << tasks[i].size_c << " ";
+    }
+#endif
   }
 
 
@@ -804,7 +822,15 @@ class KNNG {
       std::this_thread::sleep_for(std::chrono::microseconds(1000));
     }
 
-    linear_search();
+    while (time(NULL) < linear_time) {
+      uint32_t seed_num = BATCH;
+      if (time(NULL) < start_time + TIME_WARMUP || time(NULL) > linear_time - TIME_LINEAR_RESERVE) {
+        seed_num = WARMUP_SEED_BATCH;
+      }
+
+      linear_search(seed_num);
+    }
+
     linear_finished++;
     cout << "Thread " << thread_id << " linear finished" << endl;
 
@@ -812,7 +838,7 @@ class KNNG {
       std::this_thread::sleep_for(std::chrono::microseconds(1000));
     }
 
-    assert(seed_cnt == MAX_SEED_NUM);
+    assert(seed_cnt <= MAX_SEED_NUM);
 
     build_combine_relations();
     build_finished++;
@@ -882,6 +908,7 @@ class KNNG {
 int main(int argc, char* argv[]) {
   start_time = time(nullptr);
   end_time = start_time + TIME_END;
+  linear_time = start_time + TIME_LINEAR;
 
   srand(time(NULL));
 
@@ -918,14 +945,12 @@ int main(int argc, char* argv[]) {
   }
 #endif
 
-  dis_id_t *bufs = (dis_id_t*)aligned_alloc(64, M * max(K, HEAP_SIZE)  * sizeof(dis_id_t));
   nodes = (node_t*)malloc(M * sizeof(node_t));
   seeds = new Seed[MAX_SEED_NUM];
-  tasks = (task_t*)malloc(2 * MAX_SEED_NUM * sizeof(task_t));
   locks = (atomic_flag*)malloc((BATCH_M / LINEAR_VECT_BATCH) * sizeof(atomic_flag));
 
   for (uint64_t i=0; i<M; i++) {
-    nodes[i].init(bufs + i * max(K, HEAP_SIZE), HEAP_SIZE, i);
+    nodes[i].init(HEAP_SIZE, i);
   }
 
   for (int i=0; i< BATCH_M / LINEAR_VECT_BATCH; i++) {
@@ -987,9 +1012,12 @@ int main(int argc, char* argv[]) {
 
 
 #ifndef NO_FREE
+  for (int i=0; i<M; i++) {
+    nodes[i].heap.uninit();
+  }
+
   free(vectors_ptr);
   free(ids);
-  free(bufs);
   free(nodes);
   free(locks);
   delete[] seeds;

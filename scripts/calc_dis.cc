@@ -321,11 +321,11 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 
   string color = "";
 
-  if (hit < 20) {
+  if (hit < 50) {
     color = "\033[31m";
-  } else if (hit < 50) {
-    color = "\033[33m";
   } else if (hit < 80) {
+    color = "\033[33m";
+  } else if (hit < 90) {
     color = "\033[36m";
   }
 
