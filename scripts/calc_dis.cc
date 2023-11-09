@@ -36,6 +36,11 @@ atomic<size_t> accurate_hit = 0;
 atomic<size_t> accurate_num = 0;
 atomic<size_t> outlier_num = 0;
 
+unordered_map<uint32_t, size_t> min_id_map;
+size_t max_cnt = 0;
+uint32_t max_min_id = MAX_UINT32;
+
+
 
 void load_knng(string path, uint32_t *knng) {
   std::ifstream ifs;
@@ -265,8 +270,13 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
     heap.insert(dis, i);
   }
 
+  uint32_t duplicate = 0;
   unordered_set<uint32_t> exist;
   for(int i=0; i<K; i++) {
+    if (exist.count(output[i])) {
+      duplicate++;
+    }
+
     exist.insert(output[i]);
   }
 
@@ -284,6 +294,7 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 
 #ifdef PRINT_DETAIL
   float max_dis, min_dis;
+  uint32_t min_id;
 #endif
 
 
@@ -306,8 +317,10 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 
 #ifdef PRINT_DETAIL
     if (pos == K-1) max_dis = dis;
-    else if (pos == 0) min_dis = dis;
-
+    else if (pos == 0) {
+      min_dis = dis;
+      min_id = rid;
+    }
 #endif
     pos--;
   }
@@ -319,7 +332,7 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 
 #ifdef PRINT_DETAIL
 
-  string color = "";
+  string color = "\033[0m";
 
   if (hit < 50) {
     color = "\033[31m";
@@ -327,6 +340,10 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
     color = "\033[33m";
   } else if (hit < 90) {
     color = "\033[36m";
+  }
+
+  if (duplicate > 0) {
+    color = "\033[32m";
   }
 
   if (hit >= 20) {
@@ -342,8 +359,33 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
   float recall = 100.0 * total_hit / total_num / K;
   float outlier_rate = 100.0 * outlier_num / total_num;
 
+  string color_minid = "";
+
   print_lock.lock();
-  fprintf(stdout, "recall:%04.2f%% acc_recall:%04.2f%% out rate:%04.2f%% %sid:%7i hit:%3i min:%06.3f max:%06.3f:%s\033[0m\n", recall, accurate_recall, outlier_rate, color.c_str(), id, hit, min_dis, max_dis, write_buf);
+
+  min_id_map[min_id]++;
+  if (min_id_map[min_id] > max_cnt) {
+    max_min_id = min_id;
+    max_cnt = min_id_map[min_id];
+    color_minid = "\033[32m";
+  }
+
+  // size_t total_incnt;
+  // for (auto it = min_id_map.begin(); it != min_id_map.end(); ++it) {
+  //   total_incnt += it->second * it->second;
+  // }
+  // float avg_incnt = 1.0 * total_incnt / total_num;
+  size_t in_cnt = min_id_map[min_id];
+
+  float max_min_rate = 100.0 * max_cnt / total_num;
+
+  fprintf(stdout, "recall:%04.2f%% acc_recall:%04.2f%% out rate:%04.2f%% clus_cnt:%06li min_rate:%04.2f%% %smin_id:%7i %sid:%7i hit:%3i dup:%3i min:%06.3f max:%06.3f:%s\033[0m\n", recall, accurate_recall, outlier_rate, in_cnt, max_min_rate, color_minid.c_str(), min_id, color.c_str(), id, hit, duplicate,  min_dis, max_dis, write_buf);
+  if (duplicate > 0) {
+    for (int i=0; i<K; i++) {
+      cout << output[i] << " ";
+    }
+    cout << endl;
+  }
   print_lock.unlock();
 #endif
 

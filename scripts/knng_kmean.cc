@@ -19,7 +19,6 @@
 #include <unistd.h>
 #include <iomanip>
 #include <sys/resource.h>
-#include <unordered_set>
 
 using namespace std;
 
@@ -30,20 +29,20 @@ using namespace std;
 #define MAX_UINT32 0xffffffff
 #define BATCH 256
 
-#define THREAD 32
+#define THREAD 36
 
 #define LINEAR_SEED_BATCH (1 * BATCH)
 #define LINEAR_VECT_BATCH (32 * BATCH)
 
-#define MAX_SEED_NUM (10 * LINEAR_SEED_BATCH)
-#define HEAP_SIZE 100
+#define MAX_SEED_NUM (200 * LINEAR_SEED_BATCH)
+#define HEAP_SIZE 200
 #define HASH_BUCKET 130
 
 #define HEAP_CUT_THD (40 * BATCH)
-#define TARGET_INCNT 30000
+#define TARGET_INCNT 100000
 #define SEED_SEEK_DEPTH 100000
 
-#define TIME_END 30 * 60
+#define TIME_END  30 * 60
 
 //#define PACK
 #define NO_FREE
@@ -171,21 +170,19 @@ struct heap_t {
     heap_top = MAX_FLOAT;
     size = 1;
 
-    if (exist) { exist->clear(); }
+    if (exist) { exist.clear(); }
   }
 
   void build_hash() {
     assert(exist == nullptr);
-    exist = new unordered_set<uint32_t>(HASH_BUCKET);
+    exist = new unordered_set<uint32_t>();
+    exist.reserve(HASH_BUCKET);
     for (int i=0; i<size; i++) {
-      const auto ret = exist->insert(heap[i].id);
-      assert(ret.second);
+      exist.insert(heap[i].id);
     }
   }
 
   void resize(uint32_t new_size) {
-    assert(!exist);
-    if (exist) delete exist, exist = nullptr;
     uint32_t id;
     float dis;
     while (size > new_size) {
@@ -203,7 +200,7 @@ struct heap_t {
 
   void uninit() {
     free(heap);
-    if (exist) delete(exist), exist = nullptr;
+    delete(exist);
   }
 
   inline void heap_down(uint32_t index) {
@@ -241,13 +238,8 @@ struct heap_t {
   }
 
   inline void insert_unique(float dis, uint32_t id) {
-    assert(exist);
     if (size == max_size) {
       if (dis >= heap_top) { return; }
-
-      const auto ret = exist->insert(id);
-      if (!ret.second) return;
-      exist->erase(heap[0].id);
 
       heap[0].dis = dis;
       heap[0].id = id;
@@ -256,9 +248,6 @@ struct heap_t {
       heap_top = heap[0].dis;
       return;
     }
-
-    const auto ret = exist->insert(id);
-    if (!ret.second) return;
 
     heap[size].dis = dis;
     heap[size].id = id;
@@ -359,22 +348,12 @@ struct node_t {
     return MAX_UINT32;
   }
 
-  void insert_batch_v1(const float* dis, const uint32_t *ids, uint32_t num) {
+  void insert_batch(const float* dis, const uint32_t *ids, uint32_t num) {
     lock();
     for (uint32_t j=0; j<num; j++) {
       const uint32_t id2 = ids[j];
       if (id2 == id) continue;
-      heap.insert_weak(dis[j], id2);
-    }
-    unlock();
-  }
-
-  void insert_batch_v2(const float* dis, const uint32_t *ids, uint32_t num) {
-    lock();
-    for (uint32_t j=0; j<num; j++) {
-      const uint32_t id2 = ids[j];
-      if (id2 == id) continue;
-      heap.insert_unique(dis[j * BATCH], id2);
+      heap.insert(dis[j], id2);
     }
     unlock();
   }
@@ -388,7 +367,7 @@ struct node_t {
       const float dis = dis_buf[j * BATCH];
       assert(id2 != id);
 
-      heap.insert_weak(dis, id2);
+      heap.insert(dis, id2);
 
       if (dis < min_dis && dis < _min_dis) {
         _min_dis = dis;
@@ -678,6 +657,8 @@ void seed_seek_rand(uint32_t target_seed_cnt) {
   uint32_t max_incnt = 0;
   uint32_t seek_depth = 0;
 
+  bool unset = true;
+
   while (seed_cnt < target_seed_cnt) {
     uint32_t id = rand() % M;
 
@@ -714,7 +695,7 @@ void build_combine_relations() {
     seed.unlock();
 
     node.heap.resize(K);
-    // node.heap.build_hash();
+    node.heap.build_hash();
   }
 }
 
@@ -778,13 +759,8 @@ class KNNG {
 
           for(int i=0; i<size_h; i++) {
             node_t &node = nodes[task.heap_ids[i + h]];
-            node.insert_batch_v1(dis_buf + i * BATCH, task.clus_ids + c, size_c);
+            node.insert_batch(dis_buf + i * BATCH, task.clus_ids + c, size_c);
           }
-
-          // for(int i=0; i<size_c; i++) {
-          //   node_t &node = nodes[task.clus_ids[i + c]];
-          //   node.insert_batch_v2(dis_buf + i, task.heap_ids + h, size_h);
-          // }
         }
       }
     }
@@ -796,9 +772,11 @@ class KNNG {
 
     while (true) {
       uint32_t new_round = vec_batch / BATCH_M;
+      if (new_round * LINEAR_SEED_BATCH >=  MAX_SEED_NUM) break;
 
       uint32_t m_from = vec_batch % BATCH_M;
 
+      // while (locks[m_from / LINEAR_VECT_BATCH].test_and_set()) {}
 
       if (new_round != last_round) {
         if (last_round != MAX_UINT32) {
@@ -818,15 +796,13 @@ class KNNG {
             }
 
             for (int j=0; j<K; j++) {
-              node.heap.insert_weak(heap[j].dis, heap[j].id);
+              node.heap.insert(heap[j].dis, heap[j].id);
             }
 
             node.unlock();
             heaps[i].reinit();
           }
         }
-
-        if (new_round * LINEAR_SEED_BATCH >=  MAX_SEED_NUM) break;
 
         load_seed_ids(new_round * LINEAR_SEED_BATCH);
         last_round = new_round;
@@ -842,10 +818,6 @@ class KNNG {
           _mm_prefetch(reinterpret_cast<const char*>(vectors + (i + m_from) * D + j), _MM_HINT_T1);
         }
       }
-
-     #ifndef PACK
-           while (locks[m_from / LINEAR_VECT_BATCH].test_and_set()) {}
-     #endif
 
       for (uint32_t m = m_from; (m < m_from + LINEAR_VECT_BATCH) && m < M; m += BATCH) {
         const uint32_t size_v = m + BATCH > M ? M - m : BATCH;
@@ -864,15 +836,13 @@ class KNNG {
         for (int i=0; i<LINEAR_SEED_BATCH; i++) {
           for (int j=0; j<size_v; j++) {
             if (seed_ids[i] == m + j) continue;
-            heaps[i].insert_weak(dis_buf[i * BATCH + j], m + j);
+            heaps[i].insert(dis_buf[i * BATCH + j], m + j);
           }
         }
 
       }
 
-#ifndef PACK
-      locks[m_from / LINEAR_VECT_BATCH].clear();
-#endif
+      // locks[m_from / LINEAR_VECT_BATCH].clear();
 
       vec_batch = linear_vec_batch.fetch_add(LINEAR_VECT_BATCH);
     }
@@ -983,6 +953,8 @@ class KNNG {
     while(task_finished < THREAD) {
       std::this_thread::sleep_for(std::chrono::microseconds(1000));
     }
+
+
 
     combine_search();
 
@@ -1095,6 +1067,7 @@ int main(int argc, char* argv[]) {
     threads[i].join();
     delete knngs[i];
   }
+
 #endif
 
   cout << "Freeing ... Time: " << time(nullptr) - start_time << endl;
