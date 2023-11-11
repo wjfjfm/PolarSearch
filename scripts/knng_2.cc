@@ -26,12 +26,14 @@ using namespace std;
 #define K 100
 #define MAX_FLOAT 1e30
 #define MAX_UINT32 0xffffffff
-#define BATCH 256
-#define MM_BATCH 4
-#define LOCK_STEP 16384
-#define HASH_BUCKET 130
 
-#define LINEAR_SEED_BATCH (2 * BATCH)
+#define MM_BATCH 4
+#define L1_BATCH 32
+#define BATCH 256
+#define LINEAR_SEED_BATCH (1 * BATCH)
+
+#define LOCK_STEP 65536
+#define HASH_BUCKET 130
 
 #define QUE_SIZE 100
 #define MAX_SEED_NUM 150000
@@ -39,14 +41,14 @@ using namespace std;
 #define THREAD 32
 
 #define CROSS_SIZE 4096
-#define COMBINE_SIZE 20
+#define COMBINE_SIZE 10
 
-#define SEED_INACTIVE_K 4096
+#define SEED_INACTIVE_K 2048
 
 #define SEED_INACTIVE_DIS MAX_FLOAT
 
-#define TIME_END 29 * 60 - 20
-#define TIME_LINEAR 8 * 60
+#define TIME_END 180
+#define TIME_LINEAR 60
 
 #define PACK
 #define NO_FREE
@@ -91,6 +93,11 @@ atomic<size_t> combine_batch_cnt = 0;
 atomic<size_t > task_cnt = 0;
 atomic<size_t > task_drop_cnt = 0;
 atomic<size_t> rand_cnt = 0;
+
+atomic<int64_t> mm_batch_tsc = 0;
+atomic<int64_t> mm_batch_cnt = 0;
+
+int64_t rdtsc(void) { return __rdtsc(); }
 
 uint32_t heap_size = max(CROSS_SIZE, SEED_INACTIVE_K);
 
@@ -389,7 +396,6 @@ struct heap_t {
   }
 
   inline void insert_weak(float dis, uint32_t id) {
-    assert(exist == nullptr);
     if (size == max_size) {
       if (dis >= heap_top) { return; }
 
@@ -584,112 +590,119 @@ void run_batch(float* distances, float* v1, float* v2) {
   }
 }
 
+// inline void mm_mul_asm(__
+
 inline void run_linear_batch_mm(float* distances, const float* v1, const float* v2) {
-  int h, i, j, k, l, m, n;
+  int a, b, h, i, j, k, l, m, n;
   __m512 diff;
   __m512 sum[MM_BATCH * MM_BATCH];
   __m512 va[MM_BATCH];
   __m512 vb[MM_BATCH];
 
-  for (int i = 0; i < LINEAR_SEED_BATCH * D; i += 16) {
-    _mm_prefetch(reinterpret_cast<const char*>(v1 + i), _MM_HINT_T0);
-  }
-
-
+  int64_t start = rdtsc();
   for (h = 0; h < LINEAR_SEED_BATCH; h += BATCH) {
-    for (i = h * D; i < (h + BATCH) * D; i += 16) {
-      _mm_prefetch(reinterpret_cast<const char*>(v2 + h), _MM_HINT_T0);
-    }
 
-    for (i = h; i < h + BATCH; i += MM_BATCH) {
-      for (j = 0; j < BATCH; j += MM_BATCH) {
-        for (l = 0; l < 16; l++) {
-          sum[l] = _mm512_setzero_ps();
-        }
+    for (a = h; a < h + BATCH; a += L1_BATCH) {
+      for (b = 0; b < BATCH; b += L1_BATCH) {
 
 
-        for (k = 0; k < D; k += 16) {
-          for (m = 0; m<MM_BATCH; m++) {
-            va[m] = _mm512_load_ps(v1 + ((i + m) * D) + k);
-          }
+        for (i = a; i < a + L1_BATCH; i += MM_BATCH) {
+          for (j = b; j < b + L1_BATCH; j += MM_BATCH) {
 
-          for (n = 0; n<MM_BATCH; n++) {
-            vb[n] = _mm512_load_ps(v2 + (j + n) * D + k);
-          }
-
-          for (m = 0; m<MM_BATCH; m++) {
-            for (n = 0; n<MM_BATCH; n++) {
-              diff = _mm512_sub_ps(va[m], vb[n]);
-              sum[m * MM_BATCH + n] = _mm512_fmadd_ps(diff, diff, sum[m * MM_BATCH + n]);
+            for (l = 0; l < MM_BATCH * MM_BATCH; l++) {
+              sum[l] = _mm512_setzero_ps();
             }
+
+            for (k = 0; k < D; k += 16) {
+              for (m = 0; m<MM_BATCH; m++) {
+                va[m] = _mm512_load_ps(v1 + ((i + m) * D) + k);
+              }
+
+              for (n = 0; n<MM_BATCH; n++) {
+                vb[n] = _mm512_load_ps(v2 + (j + n) * D + k);
+              }
+
+
+              for (m = 0; m<MM_BATCH; m++) {
+                for (n = 0; n<MM_BATCH; n++) {
+                  diff = _mm512_sub_ps(va[m], vb[n]);
+                  sum[m * MM_BATCH + n] = _mm512_fmadd_ps(diff, diff, sum[m * MM_BATCH + n]);
+                }
+              }
+
+            }
+
+            for (m = 0; m<MM_BATCH; m++) {
+              for (n = 0; n<MM_BATCH; n++) {
+                distances[(i + m) * BATCH + j + n] = _mm512_reduce_add_ps(sum[m * MM_BATCH + n]);
+              }
+            }
+
           }
         }
 
-        for (m = 0; m<MM_BATCH; m++) {
-          for (n = 0; n<MM_BATCH; n++) {
-            distances[(i + m) * BATCH + j + n] = _mm512_reduce_add_ps(sum[m * MM_BATCH + n]);
-          }
-        }
       }
     }
   }
+
+  mm_batch_tsc.fetch_add(rdtsc() - start);
+  mm_batch_cnt.fetch_add(1);
 }
 
 void run_vp_batch_mm(float* distances, uint32_t* const idsA, uint32_t* const idsB, uint32_t sizeA, uint32_t sizeB) {
-  int i, j, k, l, m, n;
+  int a, b, i, j, k, l, m, n;
   __m512 diff, square;
-  __m512 va[4];
-  __m512 vb[4];
-  __m512 sum[16];
-  float *dis_ptr;
+  __m512 va[MM_BATCH];
+  __m512 vb[MM_BATCH];
+  __m512 sum[MM_BATCH * MM_BATCH];
   __m512* sum_ptr;
 
-  for (i = 0; i < sizeA; i++) {
-    float* vpa = vectors + idsA[i] * D;
-    for (int j = 0; j < D; j += 16) {
-      _mm_prefetch(reinterpret_cast<const char*>(vpa + j), _MM_HINT_T0);
-    }
-  }
+  int64_t start = rdtsc();
 
-  for (i = 0; i < sizeB; i++) {
-    float* vpb = vectors + idsB[i] * D;
-    for (int j = 0; j < D; j += 16) {
-      _mm_prefetch(reinterpret_cast<const char*>(vpb + j), _MM_HINT_T0);
-    }
-  }
+  for (a = 0; a < sizeA; a += L1_BATCH) {
+    for (b = 0; b < sizeB; b += L1_BATCH) {
 
-  for (i = 0; i < sizeA; i += 4) {
-    for (j = 0; j < sizeB; j += 4) {
-      for (l = 0; l < 16; l++) {
-        sum[l] = _mm512_setzero_ps();
-      }
 
-      for (k = 0; k < D; k += 16) {
-        for (m = 0; m < 4 && m + i < sizeA; m++) {
-          va[m] = _mm512_load_ps(vectors + idsA[m + i] * D + k);
-        }
+      for (i = a; i < a + L1_BATCH && i < sizeA; i += MM_BATCH) {
+        for (j = b; j < b + L1_BATCH && j < sizeB; j += MM_BATCH) {
 
-        for (n = 0; n < 4 && n + j < sizeB; n++) {
-          vb[n] = _mm512_load_ps(vectors + idsB[n + j] * D + k);
-        }
-
-        sum_ptr = sum;
-        for (m = 0; m < 4; m++) {
-          for (n = 0; n < 4; n++) {
-            diff = _mm512_sub_ps(va[m], vb[n]);
-            *sum_ptr = _mm512_fmadd_ps(diff, diff, *sum_ptr);
-            sum_ptr++;
+          for (l = 0; l < MM_BATCH * MM_BATCH; l++) {
+            sum[l] = _mm512_setzero_ps();
           }
+
+          for (k = 0; k < D; k += 16) {
+            for (m = 0; m < MM_BATCH && m + i < sizeA; m++) {
+              va[m] = _mm512_load_ps(vectors + idsA[m + i] * D + k);
+            }
+
+            for (n = 0; n < MM_BATCH && n + j < sizeB; n++) {
+              vb[n] = _mm512_load_ps(vectors + idsB[n + j] * D + k);
+            }
+
+            sum_ptr = sum;
+            for (m = 0; m < MM_BATCH; m++) {
+              for (n = 0; n < MM_BATCH; n++) {
+                diff = _mm512_sub_ps(va[m], vb[n]);
+                *sum_ptr = _mm512_fmadd_ps(diff, diff, *sum_ptr);
+                sum_ptr++;
+              }
+            }
+          }
+
+          for (m = 0; m < MM_BATCH; m++) {
+            for (n = 0; n < MM_BATCH; n++) {
+              distances[(i + m) * BATCH + j + n] = _mm512_reduce_add_ps(sum[m * MM_BATCH + n]);
+            }
+          }
+
         }
       }
 
-      for (m = 0; m < 4; m++) {
-        for (n = 0; n < 4; n++) {
-          distances[(i + m) * BATCH + j + n] = _mm512_reduce_add_ps(sum[m * 4 + n]);
-        }
-      }
     }
   }
+
+  mm_batch_tsc.fetch_add(rdtsc() - start);
+  mm_batch_cnt.fetch_add(1);
 }
 
 
@@ -775,6 +788,7 @@ void print_stat() {
   double cross_ps = cross_batch_ps * BATCH * BATCH;
   double combine_ps = combine_batch_ps * BATCH * BATCH;
   double dps = linear_ps + combine_ps + cross_ps;
+  double avg_tsc = 1.0 * mm_batch_tsc / mm_batch_cnt;
 
   std::cout << std::setprecision(2)
             << "time: " << time(nullptr) - start_time
@@ -782,6 +796,7 @@ void print_stat() {
             << "\tbatch: l(" << last_linear << ") cr(" << last_cross << ") cb(" << last_combine << ")"
             << "\tseed: set(" << seed_cnt << ") drop(" << inactive_seed_cnt << ")"
             << "\tround: build(" << build_rela_round * LOCK_STEP << ") combine(" << combine_round << ")"
+            << "\ttsc avg(" << avg_tsc << ") cnt(" << mm_batch_cnt << ")"
             << endl;
 
 }
@@ -792,6 +807,7 @@ class KNNG {
   uint32_t thread_id;
   float* seed_v;
   uint32_t* seed_ids;
+  uint32_t seed_num;
   heap_t* seed_heaps;
   float* dis_buf;
   float* v1;
@@ -840,6 +856,8 @@ class KNNG {
       memcpy(seed_v + cnt * D, vectors + id * D, D * sizeof(float));
       cnt++;
     }
+
+    seed_num = cnt;
   }
 
   void dump_heap_to_seed() {
@@ -868,13 +886,14 @@ class KNNG {
       }
 
 
-      assert(j == 0);
-      assert(seed.cross_ids[0] == seed.id);
+      // For Perf
+      //assert(j == 0);
+      //assert(seed.cross_ids[0] == seed.id);
     }
   }
 
   bool linear_search() {
-    for (uint32_t i=0; i<LINEAR_SEED_BATCH; i++) {
+    for (uint32_t i=0; i<seed_num; i++) {
       seed_heaps[i].reinit();
     }
 
@@ -898,15 +917,14 @@ class KNNG {
         for (uint64_t m = from; m < to; m += BATCH) {
           run_linear_batch_mm(dis_buf, seed_v, vectors + m * D);
 
-          for (uint32_t i=0; i<LINEAR_SEED_BATCH; i++) {
+          for (uint32_t i=0; i<seed_num; i++) {
             seed_heaps[i].insert_batch(dis_buf + i * BATCH, m);
           }
 
           for (uint32_t i=0; i<BATCH && i + m < M; i++) {
             const uint32_t id = i + m;
             heap_t &heap = heaps[id];
-            for (uint32_t j=0; j<LINEAR_SEED_BATCH; j++) {
-              if (seed_ids[j] == MAX_UINT32) continue;
+            for (uint32_t j=0; j<seed_num; j++) {
               heap.insert_weak(dis_buf[j * BATCH + i], seed_ids[j]);
             }
           }
@@ -1046,7 +1064,15 @@ bool compareByValue(const std::pair<int, int>& pair1, const std::pair<int, int>&
   return pair1.second > pair2.second;
 }
 
-
+void perf_test() {
+  // while(true) {
+  //   const uint32_t id = rand() % M;
+  //   combine_round.fetch_add((uint32_t)*(vectors + id * D));
+  // }
+  while(true) {
+    combine_round.fetch_add(1);
+  }
+}
 
 int main(int argc, char* argv[]) {
   assert(BATCH % MM_BATCH == 0);
@@ -1099,6 +1125,7 @@ int main(int argc, char* argv[]) {
     locks[i].clear();
   }
 
+
   std::cout << "Start Running..." << std::endl;
 
   vector<thread> threads;
@@ -1106,6 +1133,11 @@ int main(int argc, char* argv[]) {
   for (int i=0; i<THREAD; i++) {
     knngs.emplace_back(new KNNG(i));
     threads.emplace_back(&KNNG::knng_task, knngs[i]);
+
+    // cpu_set_t cpuset;
+    // CPU_ZERO(&cpuset);  // 清空CPU集合
+    // CPU_SET(i, &cpuset);  // 将核心编号为i的物理核心添加到集合中
+    // int result = pthread_setaffinity_np(threads[i].native_handle(), sizeof(cpu_set_t), &cpuset);
   }
 
   print_stat();
