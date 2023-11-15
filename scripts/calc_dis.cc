@@ -303,6 +303,7 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 
     if (exist.count(rid)) {
       hit++;
+      exist.erase(rid);
 
 #ifdef PRINT_DETAIL
       write_buf[pos] = '+';
@@ -324,6 +325,12 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 #endif
     pos--;
   }
+
+  vector<float> loss;
+  for (auto it: exist) {
+    loss.push_back(l2_dis_mm(vectors + id * D, vectors + it * D));
+  }
+  sort(loss.begin(), loss.end());
 
   total_hit.fetch_add(hit);
   total_num++;
@@ -363,7 +370,13 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 
   print_lock.lock();
 
-  fprintf(stdout, "recall:%04.2f%% acc_recall:%04.2f%% out rate:%04.2f%% %sid:%7i hit:%3i dup:%3i min:%06.3f max:%06.3f:%s\033[0m\n", recall, accurate_recall, outlier_rate, color.c_str(), id, hit, duplicate,  min_dis, max_dis, write_buf);
+  fprintf(stdout, "recall:%04.2f%% acc_recall:%04.2f%% out rate:%04.2f%% %sid:%7i hit:%3i dup:%3i min:%06.3f max:%06.3f:%s\033[0m", recall, accurate_recall, outlier_rate, color.c_str(), id, hit, duplicate,  min_dis, max_dis, write_buf);
+  for (float dis : loss) {
+    fprintf(stdout, " %7.5f", dis);
+  }
+
+  fprintf(stdout, "\n");
+
   if (duplicate > 0) {
     for (int i=0; i<K; i++) {
       cout << output[i] << " ";
