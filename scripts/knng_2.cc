@@ -26,7 +26,6 @@ using namespace std;
 #define K 100
 #define MAX_FLOAT 1e30
 #define MAX_UINT32 0xffffffff
-#define INACTIVE_ID 0xfffffffe
 
 #define MM_BATCH 4
 #define L1_BATCH 32
@@ -38,27 +37,30 @@ using namespace std;
 
 #define QUE_SIZE 50
 #define MAX_SEED_NUM 200000
-#define MAX_OUTLIER_SIZE 1000000
+#define MAX_OUTLIER_SIZE 2000000
 
 #define THREAD 32
 
-#define CROSS_SIZE 4096
-#define OUT_CROSS_SIZE 4096
+#define MAX_CROSS_NUM 1000000
+#define CROSS_SIZE 1024
+#define COMBINE_SIZE 4096
+#define OUT_CROSS_SIZE (max(CROSS_SIZE, COMBINE_SIZE))
 
-#define INACTIVE_COMBINE 20
-#define OUT_COMBINE 200
+#define INACTIVE_COMBINE_SUB 0
+#define OUT_COMBINE 3
+#define MIN_COMBINE 3
 
-#define SEED_INACTIVE_K 2048
-#define SEED_INACTIVE_N 2
+#define SEED_INACTIVE_K OUT_CROSS_SIZE
+#define SEED_INACTIVE_N 3
 
 #define SEED_INACTIVE_DIS MAX_FLOAT
 
-#define TIME_END 40 * 60 - 30
-#define TIME_LINEAR 20 * 60
+#define TIME_END 29 * 60 - 30
+#define TIME_LINEAR 6 * 60
 
-#define PACK
+// #define PACK
 #define NO_FREE
-// #define DEBUG
+#define DEBUG
 
 struct merge_que_t;
 struct dis_id_t;
@@ -75,7 +77,7 @@ merge_que_t* ques;
 dis_id_t* buf;
 heap_t *heaps;
 Seed *seeds;
-uint32_t* out_ids;
+// uint32_t* out_ids;
 
 time_t end_time;
 time_t start_time;
@@ -86,7 +88,7 @@ uint32_t lock_num;
 atomic<bool> load_finished = false;
 atomic<uint32_t> thread_running = 0;
 atomic<uint32_t> linear_finished = 0;
-atomic<uint32_t> build_finished = 0;
+atomic<uint32_t> during_build = 0;
 
 atomic<uint32_t> build_rela_round = 0;
 atomic<uint32_t> cross_round = 0;
@@ -95,6 +97,7 @@ atomic<uint32_t> outcross_round = 0;
 
 atomic<size_t > seed_cnt = 0;
 atomic<size_t > inactive_seed_cnt = 0;
+atomic<size_t > inactive_outlier_cnt = 0;
 atomic<size_t > out_cnt = 0;
 atomic<size_t> linear_batch_cnt = 0;
 atomic<size_t> cross_batch_cnt = 0;
@@ -158,33 +161,32 @@ struct merge_que_t {
   dis_id_t *que;
   dis_id_t *buf;
 
-  dis_id_t *que2;
-  dis_id_t *buf2;
-
   // std::atomic_flag insert_lock = ATOMIC_FLAG_INIT;
   std::mutex *insert_lock;
   std::atomic_flag sort_lock = ATOMIC_FLAG_INIT;
   std::atomic_flag seed = ATOMIC_FLAG_INIT;
-  std::atomic<uint32_t> inactive = 0;
+  std::atomic<uint32_t> active = 0;
 
   inline uint32_t set_seed() {
     uint32_t old_value = 0;
-    while (!inactive.compare_exchange_weak(old_value, SEED_INACTIVE_N)) {
-      if (old_value >= SEED_INACTIVE_N) {
-        return MAX_UINT32;
-      }
+    if (active < SEED_INACTIVE_N && !seed.test_and_set()) {
+      seed_id = seed_cnt.fetch_add(1);
+      seeds[seed_id].id = m_id;
+      seeds[seed_id].seed_id = seed_id;
+      return seed_id;
     }
 
-    seed_id = seed_cnt.fetch_add(1);
-    seeds[seed_id].id = m_id;
-    seeds[seed_id].seed_id = seed_id;
-    return seed_id;
+    return MAX_UINT32;
   }
 
   inline void inactive_seed() {
-    if(inactive.fetch_add(1) == SEED_INACTIVE_N) {
-      seed_id = INACTIVE_ID;
+    uint32_t old_value = active.fetch_add(1);
+    if (old_value + 1 == SEED_INACTIVE_N) {
       inactive_seed_cnt++;
+    }
+
+    if (old_value == 0) {
+      inactive_outlier_cnt++;
     }
   }
 
@@ -205,17 +207,15 @@ struct merge_que_t {
     sort_lock.clear(std::memory_order_release);
   }
 
-  void init(dis_id_t* _buf, uint32_t _id) {
+  void init(uint32_t _id) {
     m_id = _id;
     seed_id = MAX_UINT32;
-    que = _buf;
-    buf = que + K;
-    que2 = buf + QUE_SIZE;
-    buf2 = que2 + K;
+    que = nullptr;
+    buf = (dis_id_t*)malloc(sizeof(dis_id_t) * QUE_SIZE);
 
     // insert_lock.clear();
     insert_lock = new mutex();
-    inactive = 0;
+    active = 0;
     sort_lock.clear();
     seed.clear();
 
@@ -227,19 +227,19 @@ struct merge_que_t {
 
   void final_sort() {
     sort_set();
-    uint32_t size = buf_size;
-    buf_size = 0;
-    swap(buf, buf2);
 
-    merge_sort(size);
+    merge_sort(buf, buf_size);
+    buf_size = 0;
 
     sort_done();
   }
 
-  inline void merge_sort(uint32_t size) {
+  inline void merge_sort(dis_id_t* buf2, uint32_t size) {
     sort(buf2, buf2 + size, compare_dis_id);
 
+    dis_id_t *que2 = (dis_id_t*)malloc(sizeof(dis_id_t) * K);
     swap(que, que2);
+
     int i=0, j=0, k=0;
     uint32_t last_insert = MAX_UINT32;
     while (k < K) {
@@ -265,6 +265,8 @@ struct merge_que_t {
       }
     }
 
+    free(que2);
+
     que_size = k;
 
     if (que_size == K) {
@@ -287,11 +289,13 @@ struct merge_que_t {
     }
 
     sort_set();
+    dis_id_t* const buf2 = buf;
     buf_size = 0;
-    swap(buf, buf2);
+    buf = (dis_id_t*)malloc(sizeof(dis_id_t) * QUE_SIZE);
     unlock();
 
-    merge_sort(QUE_SIZE);
+    merge_sort(buf2, QUE_SIZE);
+    free(buf2);
     sort_done();
     return;
   }
@@ -310,13 +314,15 @@ struct merge_que_t {
       if (buf_size != QUE_SIZE) continue;
 
       sort_set();
+      dis_id_t* const buf2 = buf;
       buf_size = 0;
-      swap(buf, buf2);
+      buf = (dis_id_t*)malloc(sizeof(dis_id_t) * QUE_SIZE);
 
       unlock();
       hold_lock = false;
 
-      merge_sort(QUE_SIZE);
+      merge_sort(buf2, QUE_SIZE);
+      free(buf2);
       sort_done();
     }
 
@@ -526,6 +532,19 @@ void insert_batch_v2(const float* const distances, const uint32_t* ids1, const u
     const float* const dis = distances + j;
     merge_que_t &que = ques[id2];
     que.insert_batch(dis, ids1, size1, BATCH);
+  }
+}
+
+void dump_inactive_cnt() {
+  std::ofstream file("inactive_cnt.bin", std::ios::binary);
+  uint32_t inactive_cnt = 0;
+  for (int i=0; i<M; i++) {
+    inactive_cnt = ques[i].active;
+    if (ques[i].seed_id != MAX_UINT32) {
+      inactive_cnt = MAX_UINT32;
+    }
+
+    file.write(reinterpret_cast<char*>(&inactive_cnt), sizeof(uint32_t));
   }
 }
 
@@ -830,8 +849,8 @@ void print_stat() {
             << "time: " << time(nullptr) - start_time
             << "\tdps: " << dps << " l(" << linear_ps << ") cr(" << cross_ps << ") oc(" << out_cross_ps << ") cb(" << combine_ps << ")"
             << "\tbatch: l(" << last_linear << ") cr(" << last_cross << ") oc(" << last_out_cross << ") cb(" << last_combine << ")"
-            << "\tseed: set(" << seed_cnt << ") drop(" << inactive_seed_cnt << ")"
-            << "\tround: build(" << build_rela_round * LOCK_STEP << ") combine(" << combine_round << ")"
+            << "\tnode: seed(" << seed_cnt << ") no_seed(" << inactive_seed_cnt << ") no_out(" << inactive_outlier_cnt << ") out(" << out_cnt << ")"
+            << "\tround: build(" << build_rela_round * LOCK_STEP << ") cr(" << cross_round << ") cb(" << combine_round << ")"
             << "\treplace: ps(" << replace_ps << ") rate(" << std::setprecision(6) << replace_rate << "%)"
             << endl;
 
@@ -848,7 +867,6 @@ class KNNG {
   float* dis_buf;
   float* v1;
   bool* visited;
-  uint32_t *combine_ids;
 
   KNNG(uint32_t _id) : thread_id(_id){
     seed_v = (float*)aligned_alloc(64, LINEAR_SEED_BATCH * D * sizeof(float));
@@ -856,7 +874,6 @@ class KNNG {
     seed_heaps = (heap_t*)malloc(LINEAR_SEED_BATCH * sizeof(heap_t));
     dis_buf = (float*)aligned_alloc(64, max(LINEAR_SEED_BATCH, BATCH) * BATCH * sizeof(float));
     visited = (bool*)malloc(lock_num * sizeof(bool));
-    combine_ids = (uint32_t*)malloc(OUT_CROSS_SIZE * sizeof(uint32_t));
 
     for (int i=0; i<LINEAR_SEED_BATCH; i++) {
       seed_heaps[i].init(OUT_CROSS_SIZE);
@@ -869,7 +886,6 @@ class KNNG {
 
     free(seed_v);
     free(seed_ids);
-    free(combine_ids);
 
     free(seed_heaps);
     free(visited);
@@ -960,9 +976,7 @@ class KNNG {
             merge_que_t &que = ques[id];
             heap_t &heap = heaps[id];
 
-            if (que.seed_id == INACTIVE_ID) {
-              heap.resize(INACTIVE_COMBINE);
-            } else if (que.seed_id < INACTIVE_ID) {
+            if (que.seed_id != MAX_UINT32) {
               continue;
             }
 
@@ -990,11 +1004,10 @@ class KNNG {
   }
 
   void build_combine_relations() {
-    assert(seed_cnt + inactive_seed_cnt + MAX_OUTLIER_SIZE > M);
     uint32_t lock_id = build_rela_round.fetch_add(1);
 
     for (; lock_id<lock_num; lock_id = build_rela_round.fetch_add(1)) {
-      while(locks[lock_id].test_and_set()){}
+      assert(!locks[lock_id].test_and_set());
 
       const uint32_t from = lock_id * LOCK_STEP;
       const uint32_t to = from + LOCK_STEP > M ? M : from + LOCK_STEP;
@@ -1002,34 +1015,25 @@ class KNNG {
       for (int id = from; id < to; id++) {
         heap_t &heap = heaps[id];
 
-        if (ques[id].seed_id == INACTIVE_ID) {
-          if (heap.size > INACTIVE_COMBINE) {
-            heap.resize(INACTIVE_COMBINE);
+        if (ques[id].seed_id == MAX_UINT32) {
+          int combine_size = OUT_COMBINE - ques[id].active * INACTIVE_COMBINE_SUB;
+          if (combine_size < MIN_COMBINE) combine_size = MIN_COMBINE;
+          if (combine_size > 0) {
+            heap.resize(combine_size);
+
+            for (int i=0; i<combine_size; i++) {
+              const uint32_t seed_id = heap.heap[i].id;
+              if (seed_id == MAX_UINT32) continue;
+              seeds[seed_id].insert(id);
+            }
           }
-
-          for (int i=0; i<INACTIVE_COMBINE; i++) {
-            const uint32_t seed_id = heap.heap[i].id;
-            if (seed_id == MAX_UINT32) continue;
-            seeds[seed_id].insert(id);
-          }
-
-        } else if (ques[id].seed_id == MAX_UINT32) {
-
-          for (int i=0; i< OUT_COMBINE; i++) {
-            const uint32_t seed_id = heap.heap[i].id;
-            if (seed_id == MAX_UINT32) continue;
-            seeds[seed_id].insert(id);
-          }
-
-          out_ids[out_cnt.fetch_add(1)] = id;
         }
 
-        heap.uninit();
-        // heap.resize(K);
-        // heap.build_hash();
-      }
+        // if (ques[id].active == 0) {
+        //   out_ids[out_cnt++] = id;
+        // }
 
-      locks[lock_id].clear();
+        heap.uninit();
     }
   }
 
@@ -1043,7 +1047,7 @@ class KNNG {
     for (int m = 0; m < size1; m += BATCH) {
       const size_t size = size1 - m > BATCH ? BATCH : size1 - m;
 
-      for (int n = 0; n < OUT_CROSS_SIZE; n += BATCH) {
+      for (int n = 0; n < COMBINE_SIZE; n += BATCH) {
         run_vp_batch_mm(dis_buf, ids1 + m, ids2 + n, size, BATCH);
         insert_batch_v1(dis_buf, ids1 + m, ids2 + n, size, BATCH);
         insert_batch_v2(dis_buf, ids1 + m, ids2 + n, size, BATCH);
@@ -1051,26 +1055,6 @@ class KNNG {
       }
     }
     combine_batch_cnt.fetch_add(cnt);
-  }
-
-  void outlier_cross_search() {
-    uint32_t *ids1 = out_ids;
-    const size_t size = out_cnt;
-    size_t cnt = 0;
-
-    int m = outcross_round.fetch_add(BATCH);
-    for (; m < size; m = outcross_round.fetch_add(BATCH)) {
-      const uint32_t size1 = M - m > BATCH ? BATCH : M - m;
-      for (int n = m; n < size; n += BATCH) {
-        const uint32_t size2 = M - n > BATCH ? BATCH : M - n;
-        run_vp_batch_mm(dis_buf, ids1 + m , ids1 + n, size1, size2);
-        insert_batch_v1(dis_buf, ids1 + m, ids1 + n, size1, size2);
-        insert_batch_v2(dis_buf, ids1 + m, ids1 + n, size1, size2);
-        cnt++;
-      }
-      out_cross_batch_cnt.fetch_add(cnt);
-      cnt = 0;
-    }
   }
 
   void cross_search(uint32_t seed_id) {
@@ -1087,29 +1071,10 @@ class KNNG {
     cross_batch_cnt.fetch_add(cnt);
   }
 
-  // void out_cross_search(uint32_t seed_id) {
-  //   uint32_t *ids1 = seeds[seed_id].cross_ids;
-  //   size_t cnt = 0;
-  //   for (int m = 0; m < CROSS_SIZE; m += BATCH) {
-  //     for (int n = CROSS_SIZE; n < OUT_CROSS_SIZE; n += BATCH) {
-  //       run_vp_batch_mm(dis_buf, ids1 + m , ids1 + n, BATCH, BATCH);
-  //       insert_batch_v1(dis_buf, ids1 + m, ids1 + n, BATCH, BATCH);
-  //       insert_batch_v2(dis_buf, ids1 + m, ids1 + n, BATCH, BATCH);
-  //       cnt++;
-  //     }
-  //   }
-  //   out_cross_batch_cnt.fetch_add(cnt);
-  // }
-
   void linear_search_task() {
     seed_seek_rand();
     linear_search();
     dump_heap_to_seed();
-
-    for (int i=0; i<seed_num; i++) {
-      cross_search(seed_ids[i]);
-      // out_cross_search(seed_ids[i]);
-    }
   }
 
   bool combine_search_task() {
@@ -1125,39 +1090,38 @@ class KNNG {
       std::this_thread::sleep_for(std::chrono::microseconds(1000));
     }
 
-    while (time(NULL) < linear_time && seed_cnt + inactive_seed_cnt < M) {
+    bool finished = false;
+    while (time(NULL) < linear_time && seed_cnt + inactive_seed_cnt < M && !finished) {
       linear_search_task();
     }
+
     linear_finished++;
 
     cout << "Thread " << thread_id << " linear finihsed" << endl;
 
-    while(linear_finished < THREAD) {
-      std::this_thread::sleep_for(std::chrono::microseconds(1000));
-    }
+    if (M <= 10000) std::this_thread::sleep_for(std::chrono::seconds(3));
 
-    build_combine_relations();
-    build_finished++;
+    // uint32_t seed_id = cross_round.fetch_add(1);
+    // while (seed_id < MAX_CROSS_NUM && seed_id < seed_cnt) {
+    //   cross_search(seed_id);
+    //   seed_id = cross_round.fetch_add(1);
+    // }
 
-    while(build_finished < THREAD ) {
-      std::this_thread::sleep_for(std::chrono::microseconds(1000));
-    }
+    // while(linear_finished < THREAD) {
+    //   std::this_thread::sleep_for(std::chrono::microseconds(1000));
+    // }
 
-    outlier_cross_search();
+    // during_build++;
+    // build_combine_relations();
+    // during_build--;
 
-#ifdef DEBUG
-    if (thread_id == 0) {
-      for (int i=0; i<seed_cnt; i++) {
-       Seed &seed = seeds[i];
-       cout << seed.combine_ids.size() << endl;
-      }
-    }
-#endif
+    // while(during_build > 0) {
+    //   std::this_thread::sleep_for(std::chrono::microseconds(1000));
+    // }
 
-
-    while (time(NULL) < end_time) {
-      if (!combine_search_task()) break;
-    }
+    // while (time(NULL) < end_time) {
+    //   if (!combine_search_task()) break;
+    // }
 
     thread_running--;
   }
@@ -1203,14 +1167,14 @@ int main(int argc, char* argv[]) {
   lock_num = ((M + LOCK_STEP - 1) / LOCK_STEP);
   locks = (atomic_flag*)malloc(lock_num * sizeof(atomic_flag));
 
-  buf = (dis_id_t*)malloc(M * 2 * (K + QUE_SIZE) * sizeof(dis_id_t));
+  // buf = (dis_id_t*)malloc(M * 2 * (K + QUE_SIZE) * sizeof(dis_id_t));
   ques = (merge_que_t*)malloc(M * sizeof(merge_que_t));
   heaps = (heap_t*)malloc(M * sizeof(heap_t));
   seeds = new Seed[MAX_SEED_NUM];
-  out_ids = (uint32_t*)malloc(sizeof(uint32_t) * MAX_OUTLIER_SIZE);
+  // out_ids = (uint32_t*)malloc(sizeof(uint32_t) * MAX_OUTLIER_SIZE);
 
   for (uint64_t i=0; i<M; i++) {
-    ques[i].init(buf + i * 2 * (K + QUE_SIZE), i);
+    ques[i].init(i);
     // ques[i].init(0, i);
   }
 
@@ -1264,6 +1228,11 @@ int main(int argc, char* argv[]) {
 
   close(fd);
 
+#ifdef DEBUG
+  cout << "Debug: dump inactive" << endl;
+  dump_inactive_cnt();
+#endif
+
 #ifndef NO_FREE
   for (int i=0; i<THREAD; i++) {
     threads[i].join();
@@ -1282,7 +1251,7 @@ int main(int argc, char* argv[]) {
 #ifndef NO_FREE
   free(vectors_ptr);
   free(ids);
-  free(buf);
+  // free(buf);
   free(ques);
   for (int i=0; i<THREAD; i++) {
     delete knngs[i];

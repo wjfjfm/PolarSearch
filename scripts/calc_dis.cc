@@ -1,3 +1,6 @@
+#include <cassert>
+#include <fcntl.h>
+#include <unistd.h>
 #include <iostream>
 #include <fstream>
 #include <string>
@@ -11,10 +14,10 @@
 #include <mutex>
 #include <vector>
 
-#define PRINT_DETAIL
 #define APPRO_NUM 1000
 #define MAX_FLOAT 1e30
 #define MAX_UINT32 0xffffffff
+#define WITH_INACTIVE
 
 using namespace std;
 
@@ -26,6 +29,7 @@ uint32_t THREAD = 32;
 
 float* vectors;
 uint32_t* outputs;
+int inactive_file = -1;
 
 std::mutex print_lock;
 atomic<size_t> total_hit = 0;
@@ -280,22 +284,16 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
     exist.insert(output[i]);
   }
 
-#ifdef PRINT_DETAIL
   int pos = K;
   char* write_buf = (char*) malloc((K+1) * sizeof(char));
   write_buf[pos--] = '\0';
-#else
-  int pos = K - 1;
-#endif
 
   int hit = 0;
   uint32_t rid;
   float dis;
 
-#ifdef PRINT_DETAIL
   float max_dis, min_dis;
   uint32_t min_id;
-#endif
 
 
   for(int i=0; i<K; i++) {
@@ -305,24 +303,18 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
       hit++;
       exist.erase(rid);
 
-#ifdef PRINT_DETAIL
       write_buf[pos] = '+';
-#endif
 
     } else {
 
-#ifdef PRINT_DETAIL
       write_buf[pos] = '-';
-#endif
     }
 
-#ifdef PRINT_DETAIL
     if (pos == K-1) max_dis = dis;
     else if (pos == 0) {
       min_dis = dis;
       min_id = rid;
     }
-#endif
     pos--;
   }
 
@@ -337,15 +329,13 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 
   if (hit == 100) all_hit++;
 
-#ifdef PRINT_DETAIL
-
   string color = "\033[0m";
 
-  if (hit < 50) {
+  if (hit < 90) {
     color = "\033[31m";
-  } else if (hit < 80) {
+  } else if (hit < 95) {
     color = "\033[33m";
-  } else if (hit < 90) {
+  } else if (hit < 98) {
     color = "\033[36m";
   }
 
@@ -353,13 +343,19 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
     color = "\033[32m";
   }
 
-  if (hit >= 20) {
-    accurate_hit += hit;
-    accurate_num++;
+
+
+  uint32_t inactive_cnt = 0;
+  if (inactive_file >=0) {
+    uint32_t bytes = pread(inactive_file, &inactive_cnt, sizeof(uint32_t), id * sizeof(uint32_t));
+    assert(bytes = 4);
   }
 
-  if (hit < 20) {
+  if (inactive_cnt < 2) {
     outlier_num++;
+  } else {
+    accurate_hit += hit;
+    accurate_num++;
   }
 
   float accurate_recall = 100.0 * accurate_hit / accurate_num / K;
@@ -368,9 +364,11 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 
   string color_minid = "";
 
+
+
   print_lock.lock();
 
-  fprintf(stdout, "recall:%04.2f%% acc_recall:%04.2f%% out rate:%04.2f%% %sid:%7i hit:%3i dup:%3i min:%06.3f max:%06.3f:%s\033[0m", recall, accurate_recall, outlier_rate, color.c_str(), id, hit, duplicate,  min_dis, max_dis, write_buf);
+  fprintf(stdout, "recall:%04.2f%% acall:%04.2f%% out:%04.2f%% %sid:%7i act:%5i hit:%3i dup:%3i min:%06.3f max:%06.3f:%s\033[0m", recall, accurate_recall, outlier_rate, color.c_str(), id, inactive_cnt, hit, duplicate,  min_dis, max_dis, write_buf);
   for (float dis : loss) {
     fprintf(stdout, " %7.5f", dis);
   }
@@ -384,7 +382,6 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
     cout << endl;
   }
   print_lock.unlock();
-#endif
 
   return hit;
 }
@@ -434,6 +431,12 @@ int main(int argc, char* argv[]) {
   vectors = (float*)malloc(M * D * sizeof(float));
   memset(vectors, 0, M * D * sizeof(float));
   outputs = (uint32_t*)malloc(M * K * sizeof(uint32_t));
+
+  #ifdef WITH_INACTIVE
+  inactive_file = open("inactive_cnt.bin", O_RDONLY);
+  assert(inactive_file != -1);
+  #endif
+
   uint32_t* answers;
 
   if (with_answer) {
