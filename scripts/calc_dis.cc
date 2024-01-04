@@ -307,7 +307,20 @@ uint64_t calc_recall_appro(float* vectors, uint32_t id, uint32_t *output) {
 
     } else {
 
-      write_buf[pos] = '-';
+
+      if (inactive_file >=0) {
+        uint32_t inactive_cnt;
+        uint32_t bytes = pread(inactive_file, &inactive_cnt, sizeof(uint32_t), rid * sizeof(uint32_t));
+        assert(bytes = 4);
+
+        if (inactive_cnt == 0) {
+          write_buf[pos] = '0';
+        } else {
+          write_buf[pos] = '-';
+        }
+      } else {
+        write_buf[pos] = '-';
+      }
     }
 
     if (pos == K-1) max_dis = dis;

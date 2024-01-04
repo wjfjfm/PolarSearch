@@ -35,11 +35,12 @@ using namespace std;
 #define LOCK_STEP 65536
 #define HASH_BUCKET 130
 
-#define HASH_SHIFT 8
-#define HASH_SIZE 512
-#define HASH_BITMAP 0x1ff
 
-#define QUE_SIZE 50
+#define HASH_SHIFT 8
+#define HASH_SIZE (1 << HASH_SHIFT)
+#define HASH_BITMAP 0xff
+
+#define QUE_SIZE 100
 #define MAX_SEED_NUM 200000
 #define MAX_OUTLIER_SIZE 2000000
 
@@ -51,8 +52,8 @@ using namespace std;
 #define CB_COMBINE_SIZE 4096
 #define OUT_CROSS_SIZE (max(CROSS_SIZE, COMBINE_SIZE))
 
-#define INACTIVE_COMBINE_SUB 7
-#define OUT_COMBINE 110
+#define INACTIVE_COMBINE_SUB 8
+#define OUT_COMBINE 90
 #define MIN_COMBINE 3
 
 #define SEED_INACTIVE_K CROSS_SIZE
@@ -60,17 +61,16 @@ using namespace std;
 
 #define SEED_INACTIVE_DIS MAX_FLOAT
 
-#define TIME_END 29 * 60 - 20
-#define TIME_LINEAR 5 * 60 + 10
+#define TIME_END 29 * 60 - 25
+#define TIME_LINEAR 5 * 60
 
 #define PACK
 #define NO_FREE
-// #define DEBUG
+#define DEBUG
 
 struct merge_que_t;
 struct dis_id_t;
 struct heap_t;
-struct node_t;
 class Seed;
 
 uint64_t M = 0;
@@ -82,8 +82,6 @@ atomic_flag *locks;
 uint32_t* ids;
 uint32_t* sqorder_ids;
 merge_que_t* ques;
-node_t* nodes;
-uint16_t *hashs;
 dis_id_t* buf;
 heap_t *heaps;
 Seed *seeds;
@@ -170,29 +168,31 @@ struct id2_dis_t {
   float dis;
 };
 
-struct node_t {
+struct merge_que_t {
+  float hwm;
+  uint32_t m_id;
   uint32_t seed_id;
-  uint32_t id;
+  uint32_t buf_size;
+  uint32_t que_size;
+  dis_id_t *que;
+  dis_id_t *buf;
+  // uint16_t *hash;
+
+  std::atomic_flag insert_lock = ATOMIC_FLAG_INIT;
+  // std::mutex *insert_lock;
+  // std::atomic_flag sort_lock = ATOMIC_FLAG_INIT;
+  std::mutex * sort_lock;
   std::atomic_flag seed = ATOMIC_FLAG_INIT;
-  std::vector<uint32_t> *in_ids;
-  std::atomic_flag inids_lock = ATOMIC_FLAG_INIT;
   std::atomic<uint32_t> active = 0;
 
-  void init(uint32_t _id) {
-    seed_id = MAX_UINT32;
-    id = _id;
-    seed.clear();
-    in_ids = new vector<uint32_t>();
-    in_ids->reserve(100);
-    inids_lock.clear();
-    active = 0;
-  }
+  std::vector<uint32_t> *in_ids;
+  std::atomic_flag inids_lock = ATOMIC_FLAG_INIT;
 
   inline uint32_t set_seed() {
     uint32_t old_value = 0;
     if (active < SEED_INACTIVE_N && !seed.test_and_set()) {
       seed_id = seed_cnt.fetch_add(1);
-      seeds[seed_id].id = id;
+      seeds[seed_id].id = m_id;
       seeds[seed_id].seed_id = seed_id;
       return seed_id;
     }
@@ -210,22 +210,6 @@ struct node_t {
       inactive_outlier_cnt++;
     }
   }
-};
-
-struct merge_que_t {
-  float hwm;
-  uint32_t m_id;
-  uint32_t buf_size;
-  uint32_t que_size;
-  dis_id_t *que;
-  dis_id_t *buf;
-  uint16_t *hash;
-
-  std::atomic_flag insert_lock = ATOMIC_FLAG_INIT;
-  // std::mutex *insert_lock;
-  // std::atomic_flag sort_lock = ATOMIC_FLAG_INIT;
-  std::mutex * sort_lock;
-
 
   inline void lock() {
     while (insert_lock.test_and_set(std::memory_order_acquire)) { }
@@ -246,19 +230,24 @@ struct merge_que_t {
     sort_lock->unlock();
   }
 
-  void init(uint32_t _id, uint16_t* _hash) {
-  // void init(uint32_t _id) {
+  // void init(uint32_t _id, uint16_t* _hash) {
+  void init(uint32_t _id) {
     m_id = _id;
+    seed_id = MAX_UINT32;
     que = nullptr;
     buf = (dis_id_t*)malloc(sizeof(dis_id_t) * QUE_SIZE);
     // hash = (uint16_t*)malloc(sizeof(uint16_t) * HASH_SIZE);
-    hash = _hash;
-    memset(hash, 0xff, HASH_SIZE * sizeof(uint16_t));
+    // hash = _hash;
 
     insert_lock.clear();
     // insert_lock = new mutex();
+    in_ids = new vector<uint32_t>();
+    in_ids->reserve(100);
+    inids_lock.clear();
+    active = 0;
     // sort_lock.clear();
     sort_lock = new mutex();
+    seed.clear();
 
     hwm = MAX_FLOAT;
     que_size = 0;
@@ -319,17 +308,17 @@ struct merge_que_t {
 
     if (que_size == K) {
       hwm = que[K-1].dis;
-      // replacement.fetch_add(K - i);
+      replacement.fetch_add(K - i);
     }
   }
 
-  inline bool hash_check_and_set(uint32_t id) {
-    const uint16_t val = id >> HASH_SHIFT;
-    const uint32_t pos = id & HASH_BITMAP;
-    if (hash[pos] == val) return true;
-    hash[pos] = val;
-    return false;
-  }
+  // inline bool hash_check_and_set(uint32_t id) {
+  //   const uint16_t val = id >> HASH_SHIFT;
+  //   const uint32_t pos = id & HASH_BITMAP;
+  //   if (hash[pos] == val) return false;
+  //   hash[pos] = val;
+  //   return true;
+  // }
 
   // void insert(float dis, uint32_t id) {
   //   if (dis >= hwm) return;
@@ -359,12 +348,11 @@ struct merge_que_t {
   // }
 
   inline void insert_batch(const float *dis, const uint32_t *ids, uint32_t size, uint32_t step) {
-    // bool hold_lock = false;
-    const uint32_t* const ids_end = ids + size;
-    for (; ids < ids_end; dis+=step, ids++) {
+    bool hold_lock = false;
+    for (int i=0; i<size; i++, dis+=step, ids++) {
       if (__builtin_expect(*dis >= hwm, true)) continue;
-      if (__builtin_expect(hash_check_and_set(*ids), true)) continue;
       if (__builtin_expect(*ids == m_id, false)) continue;
+      // if (!hash_check_and_set(*ids)) continue;
 
       // if (!hold_lock) lock(), hold_lock = true;
       lock();
@@ -372,7 +360,7 @@ struct merge_que_t {
       buf[buf_size].id = *ids;
       buf_size++;
 
-      if (__builtin_expect(buf_size != QUE_SIZE, false)) {
+      if (__builtin_expect(buf_size != QUE_SIZE, true)) {
         unlock();
         continue;
       }
@@ -381,7 +369,7 @@ struct merge_que_t {
       buf = (dis_id_t*)malloc(sizeof(dis_id_t) * QUE_SIZE);
       buf_size = 0;
       unlock();
-      // hold_lock = false;
+      hold_lock = false;
 
       merge_sort(buf2, QUE_SIZE);
 
@@ -602,8 +590,8 @@ void dump_inactive_cnt() {
   std::ofstream file("inactive_cnt.bin", std::ios::binary);
   uint32_t inactive_cnt = 0;
   for (int i=0; i<M; i++) {
-    inactive_cnt = nodes[i].active;
-    if (nodes[i].seed_id != MAX_UINT32) {
+    inactive_cnt = ques[i].active;
+    if (ques[i].seed_id != MAX_UINT32) {
       inactive_cnt = MAX_UINT32;
     }
 
@@ -712,99 +700,47 @@ inline float get_sqsum_half(uint32_t id) {
   return _mm512_reduce_add_ps(sum) / 2;
 }
 
-inline void run_batch_mm_half(float* distances, const float* v1, const float* v2, const float* const sq1, const float* const sq2, uint32_t sizeA, uint32_t sizeB) {
-  int a, b, i, j, k, l, m, n;
-  __m512 diff;
-  __m512 sum[MM_BATCH * MM_BATCH];
-  __m512 va[MM_BATCH];
-  __m512 vb[MM_BATCH];
-
-  for (int a = 0; a < BATCH && a < sizeA; a += L1_BATCH) {
-    for (int b = 0; b < BATCH && b < sizeB; b += L1_BATCH) {
-
-      for (int i = a; i < a + L1_BATCH; i += MM_BATCH) {
-        for (int j = b; j < b + L1_BATCH; j += MM_BATCH) {
-
-          for (int l = 0; l < MM_BATCH * MM_BATCH; l++) {
-            sum[l] = _mm512_setzero_ps();
-          }
-
-          for (int k = 0; k < D; k += 16) {
-            for (int m = 0; m<MM_BATCH; m++) {
-              va[m] = _mm512_load_ps(v1 + ((i + m) * D) + k);
-            }
-
-            for (int n = 0; n<MM_BATCH; n++) {
-              vb[n] = _mm512_load_ps(v2 + (j + n) * D + k);
-            }
-
-
-            for (int m = 0; m<MM_BATCH; m++) {
-              for (int n = 0; n<MM_BATCH; n++) {
-                sum[m * MM_BATCH + n] = _mm512_fmadd_ps(va[m], vb[n], sum[m * MM_BATCH + n]);
-              }
-            }
-
-          }
-
-          for (int m = 0; m<MM_BATCH; m++) {
-            for (int n = 0; n<MM_BATCH; n++) {
-              distances[(i + m) * BATCH + j + n] = sq1[i + m] + sq2[j + n] - _mm512_reduce_add_ps(sum[m * MM_BATCH + n]);
-            }
-          }
-
-        }
-      }
-
-    }
-  }
-  
-
-  // mm_batch_tsc.fetch_add(rdtsc() - start);
-  // mm_batch_cnt.fetch_add(1);
-}
-
 inline void run_linear_batch_mm_half(float* distances, const float* v1, const float* v2, uint32_t *ids1, uint32_t* ids2) {
-  // int a, b, h, i, j, k, l, m, n;
+  int a, b, h, i, j, k, l, m, n;
   __m512 diff;
   __m512 sum[MM_BATCH * MM_BATCH];
   __m512 va[MM_BATCH];
   __m512 vb[MM_BATCH];
 
   // int64_t start = rdtsc();
-  for (int h = 0; h < LINEAR_SEED_BATCH; h += BATCH) {
+  for (h = 0; h < LINEAR_SEED_BATCH; h += BATCH) {
 
-    for (int a = h; a < h + BATCH; a += L1_BATCH) {
-      for (int b = 0; b < BATCH; b += L1_BATCH) {
+    for (a = h; a < h + BATCH; a += L1_BATCH) {
+      for (b = 0; b < BATCH; b += L1_BATCH) {
 
 
-        for (int i = a; i < a + L1_BATCH; i += MM_BATCH) {
-          for (int j = b; j < b + L1_BATCH; j += MM_BATCH) {
+        for (i = a; i < a + L1_BATCH; i += MM_BATCH) {
+          for (j = b; j < b + L1_BATCH; j += MM_BATCH) {
 
-            for (int l = 0; l < MM_BATCH * MM_BATCH; l++) {
+            for (l = 0; l < MM_BATCH * MM_BATCH; l++) {
               sum[l] = _mm512_setzero_ps();
             }
 
-            for (int k = 0; k < D; k += 16) {
-              for (int m = 0; m<MM_BATCH; m++) {
+            for (k = 0; k < D; k += 16) {
+              for (m = 0; m<MM_BATCH; m++) {
                 va[m] = _mm512_load_ps(v1 + ((i + m) * D) + k);
               }
 
-              for (int n = 0; n<MM_BATCH; n++) {
+              for (n = 0; n<MM_BATCH; n++) {
                 vb[n] = _mm512_load_ps(v2 + (j + n) * D + k);
               }
 
 
-              for (int m = 0; m<MM_BATCH; m++) {
-                for (int n = 0; n<MM_BATCH; n++) {
+              for (m = 0; m<MM_BATCH; m++) {
+                for (n = 0; n<MM_BATCH; n++) {
                   sum[m * MM_BATCH + n] = _mm512_fmadd_ps(va[m], vb[n], sum[m * MM_BATCH + n]);
                 }
               }
 
             }
 
-            for (int m = 0; m<MM_BATCH; m++) {
-              for (int n = 0; n<MM_BATCH; n++) {
+            for (m = 0; m<MM_BATCH; m++) {
+              for (n = 0; n<MM_BATCH; n++) {
                 distances[(i + m) * BATCH + j + n] = sqsum[ids1[i + m]] + sqsum[ids2[j + n]] - _mm512_reduce_add_ps(sum[m * MM_BATCH + n]);
               }
             }
@@ -898,12 +834,10 @@ inline void run_vp_batch_mm_half(float* distances, uint32_t* const idsA, uint32_
 
           for (k = 0; k < D; k += 16) {
             for (m = 0; m < MM_BATCH && m + i < sizeA; m++) {
-            // for (m = 0; m < MM_BATCH; m++) {
               va[m] = _mm512_load_ps(vectors + idsA[m + i] * D + k);
             }
 
             for (n = 0; n < MM_BATCH && n + j < sizeB; n++) {
-            // for (n = 0; n < MM_BATCH; n++) {
               vb[n] = _mm512_load_ps(vectors + idsB[n + j] * D + k);
             }
 
@@ -916,9 +850,59 @@ inline void run_vp_batch_mm_half(float* distances, uint32_t* const idsA, uint32_
 
           for (m = 0; m < MM_BATCH && m + i < sizeA; m++) {
             for (n = 0; n < MM_BATCH && n + j < sizeB; n++) {
-          // for (m = 0; m < MM_BATCH; m++) {
-          //   for (n = 0; n < MM_BATCH; n++) {
               distances[(i + m) * BATCH + j + n] = sqsum[idsA[m + i]] + sqsum[idsB[n + j]] - _mm512_reduce_add_ps(sum[m * MM_BATCH + n]);
+            }
+          }
+
+        }
+      }
+
+    }
+  }
+
+  // mm_batch_tsc.fetch_add(rdtsc() - start);
+  // mm_batch_cnt.fetch_add(1);
+}
+
+inline void run_vp_batch_mm(float* distances, uint32_t* const idsA, uint32_t* const idsB, uint32_t sizeA, uint32_t sizeB) {
+  int a, b, i, j, k, l, m, n;
+  __m512 diff;
+  __m512 va[MM_BATCH];
+  __m512 vb[MM_BATCH];
+  __m512 sum[MM_BATCH * MM_BATCH];
+
+  // int64_t start = rdtsc();
+
+  for (a = 0; a < sizeA; a += L1_BATCH) {
+    for (b = 0; b < sizeB; b += L1_BATCH) {
+
+      for (i = a; i < a + L1_BATCH && i < sizeA; i += MM_BATCH) {
+        for (j = b; j < b + L1_BATCH && j < sizeB; j += MM_BATCH) {
+
+          for (l = 0; l < MM_BATCH * MM_BATCH; l++) {
+            sum[l] = _mm512_setzero_ps();
+          }
+
+          for (k = 0; k < D; k += 16) {
+            for (m = 0; m < MM_BATCH && m + i < sizeA; m++) {
+              va[m] = _mm512_load_ps(vectors + idsA[m + i] * D + k);
+            }
+
+            for (n = 0; n < MM_BATCH && n + j < sizeB; n++) {
+              vb[n] = _mm512_load_ps(vectors + idsB[n + j] * D + k);
+            }
+
+            for (m = 0; m < MM_BATCH; m++) {
+              for (n = 0; n < MM_BATCH; n++) {
+                diff = _mm512_sub_ps(va[m], vb[n]);
+                sum[m * MM_BATCH + n] = _mm512_fmadd_ps(diff, diff, sum[m * MM_BATCH + n]);
+              }
+            }
+          }
+
+          for (m = 0; m < MM_BATCH; m++) {
+            for (n = 0; n < MM_BATCH; n++) {
+              distances[(i + m) * BATCH + j + n] = _mm512_reduce_add_ps(sum[m * MM_BATCH + n]);
             }
           }
 
@@ -1061,12 +1045,8 @@ class KNNG {
   uint32_t seed_num;
   heap_t* seed_heaps;
   float* dis_buf;
-  bool* visited;
-
   float* v1;
-  float* v2;
-  float* sq1;
-  float* sq2;
+  bool* visited;
 
   KNNG(uint32_t _id) : thread_id(_id){
     seed_v = (float*)aligned_alloc(64, LINEAR_SEED_BATCH * D * sizeof(float));
@@ -1075,12 +1055,6 @@ class KNNG {
     seed_heaps = (heap_t*)malloc(LINEAR_SEED_BATCH * sizeof(heap_t));
     dis_buf = (float*)aligned_alloc(64, max(LINEAR_SEED_BATCH, BATCH) * BATCH * sizeof(float));
     visited = (bool*)malloc(lock_num * sizeof(bool));
-
-    v1 = (float*)aligned_alloc(64, BATCH * D * sizeof(float));
-    v2 = (float*)aligned_alloc(64, BATCH * D * sizeof(float));
-
-    sq1 = (float*)aligned_alloc(64, BATCH * sizeof(float));
-    sq2 = (float*)aligned_alloc(64, BATCH * sizeof(float));
 
     for (int i=0; i<LINEAR_SEED_BATCH; i++) {
       seed_heaps[i].init(OUT_CROSS_SIZE);
@@ -1108,7 +1082,7 @@ class KNNG {
     while (cnt < LINEAR_SEED_BATCH && seed_cnt + inactive_seed_cnt < M) {
       id = rand() % M;
 
-      const uint32_t seed_id = nodes[id].set_seed();
+      const uint32_t seed_id = ques[id].set_seed();
       if (seed_id == MAX_UINT32) {
         continue;
       }
@@ -1142,7 +1116,7 @@ class KNNG {
         }
 
         if (j < SEED_INACTIVE_K && dis < SEED_INACTIVE_DIS) {
-          nodes[id].inactive_seed();
+          ques[id].inactive_seed();
         }
       }
 
@@ -1157,6 +1131,7 @@ class KNNG {
 
     memset(visited, 0, lock_num * sizeof(bool));
 
+    size_t cnt = 0;
     bool skipped = true;
     while (skipped) {
       skipped = false;
@@ -1181,7 +1156,12 @@ class KNNG {
 
           for (uint32_t i=0; i<BATCH && i + m < M; i++) {
             const uint32_t id = i + m;
+            merge_que_t &que = ques[id];
             heap_t &heap = heaps[id];
+
+            if (que.seed_id != MAX_UINT32) {
+              continue;
+            }
 
             float* dis = dis_buf + i;
             for (uint32_t j=0; j<seed_num; j++, dis += BATCH) {
@@ -1189,13 +1169,19 @@ class KNNG {
               heap.insert_weak(*dis, seed_ids[j]);
             }
           }
-          linear_batch_cnt.fetch_add(1);
+
+          cnt++;
+          if (cnt > 1000) {
+            linear_batch_cnt.fetch_add(cnt);
+            cnt = 0;
+          }
         }
 
         locks[lock_id].clear();
       }
     }
 
+    linear_batch_cnt.fetch_add(cnt);
 
     return true;
   }
@@ -1212,8 +1198,8 @@ class KNNG {
       for (int id = from; id < to; id++) {
         heap_t &heap = heaps[id];
 
-        if (nodes[id].seed_id == MAX_UINT32) {
-          int64_t combine_size = OUT_COMBINE - (int64_t)nodes[id].active *  INACTIVE_COMBINE_SUB;
+        if (ques[id].seed_id == MAX_UINT32) {
+          int64_t combine_size = OUT_COMBINE - (int64_t)ques[id].active *  INACTIVE_COMBINE_SUB;
           if (combine_size < MIN_COMBINE) combine_size = MIN_COMBINE;
           if (combine_size > 0) {
             heap.resize(combine_size);
@@ -1237,16 +1223,15 @@ class KNNG {
 
   void tune_search(uint32_t id) {
     merge_que_t &que = ques[id];
-    node_t &node = nodes[id];
-    uint32_t *ids1 = node.in_ids->data();
-    const size_t size1 = node.in_ids->size();
+    uint32_t *ids1 = que.in_ids->data();
+    const size_t size1 = que.in_ids->size();
 
     uint32_t *ids2 = (uint32_t*)malloc(K * sizeof(uint32_t));
-    que.sort_set();
+    que.lock();
     for (int i=0; i<K; i++) {
       ids2[i] = que.que[i].id;
     }
-    que.sort_done();
+    que.unlock();
 
     for (int m = 0; m < size1; m += BATCH) {
       const size_t size = size1 - m > BATCH ? BATCH : size1 - m;
@@ -1300,21 +1285,10 @@ class KNNG {
     for (int m = 0; m < size1; m += BATCH) {
       const size_t size = size1 - m > BATCH ? BATCH : size1 - m;
 
-      for (int i=0; i< size; i++) {
-        memcpy(v1 + i * D, vectors + ids1[m + i] * D, D * sizeof(float));
-        sq1[i] = sqsum[ids1[m + i]];
-      }
-
       for (int n = 0; n < size1; n += BATCH) {
         const size_t sizeB = size1 - n > BATCH ? BATCH : size1 - n;
-        for (int i=0; i< sizeB; i++) {
-          memcpy(v2 + i * D, vectors + ids1[n + i] * D, D * sizeof(float));
-          sq2[i] = sqsum[ids1[n + i]];
-        }
 
-        // run_vp_batch_mm_half(dis_buf, ids1 + m, ids1 + n, size, sizeB);
-        run_batch_mm_half(dis_buf, v1, v2, sq1, sq2, size, sizeB);
-
+        run_vp_batch_mm_half(dis_buf, ids1 + m, ids1 + n, size, sizeB);
         insert_batch_v1(dis_buf, ids1 + m, ids1 + n, size, sizeB);
         insert_batch_v2(dis_buf, ids1 + m, ids1 + n, size, sizeB);
         cb_combine_batch_cnt.fetch_add(1);
@@ -1332,20 +1306,8 @@ class KNNG {
     for (int m = 0; m < size1; m += BATCH) {
       const size_t size = size1 - m > BATCH ? BATCH : size1 - m;
 
-      for (int i=0; i< size; i++) {
-        memcpy(v1 + i * D, vectors + ids1[m + i] * D, D * sizeof(float));
-        sq1[i] = sqsum[ids1[m + i]];
-      }
-
       for (int n = 0; n < COMBINE_SIZE; n += BATCH) {
-        for (int i=0; i< BATCH; i++) {
-          memcpy(v2 + i * D, vectors + ids2[n + i] * D, D * sizeof(float));
-          sq2[i] = sqsum[ids2[n + i]];
-        }
-
-        // run_vp_batch_mm_half(dis_buf, ids1 + m, ids2 + n, size, BATCH);
-        run_batch_mm_half(dis_buf, v1, v2, sq1, sq2, size, BATCH);
-
+        run_vp_batch_mm_half(dis_buf, ids1 + m, ids2 + n, size, BATCH);
         insert_batch_v1(dis_buf, ids1 + m, ids2 + n, size, BATCH);
         insert_batch_v2(dis_buf, ids1 + m, ids2 + n, size, BATCH);
         combine_batch_cnt.fetch_add(1);
@@ -1358,19 +1320,8 @@ class KNNG {
     uint32_t *ids1 = seeds[seed_id].cross_ids;
     size_t cnt = 0;
     for (int m = 0; m < CROSS_SIZE; m += BATCH) {
-      for (int i=0; i< BATCH; i++) {
-        memcpy(v1 + i * D, vectors + ids1[m + i] * D, D * sizeof(float));
-        sq1[i] = sqsum[ids1[m + i]];
-      }
-
       for (int n = m; n < CROSS_SIZE; n += BATCH) {
-        for (int i=0; i< BATCH; i++) {
-          memcpy(v2 + i * D, vectors + ids1[n + i] * D, D * sizeof(float));
-          sq2[i] = sqsum[ids1[n + i]];
-        }
-
-        run_batch_mm_half(dis_buf, v1, v2, sq1, sq2, BATCH, BATCH);
-        // run_vp_batch_mm_half(dis_buf, ids1 + m , ids1 + n, BATCH, BATCH);
+        run_vp_batch_mm_half(dis_buf, ids1 + m , ids1 + n, BATCH, BATCH);
         insert_batch_v1(dis_buf, ids1 + m, ids1 + n, BATCH, BATCH);
         insert_batch_v2(dis_buf, ids1 + m, ids1 + n, BATCH, BATCH);
         cnt++;
@@ -1396,7 +1347,7 @@ class KNNG {
     during1++;
     uint32_t id = init_inids_round.fetch_add(1);
     while (id < M) {
-      nodes[id].in_ids->clear();
+      ques[id].in_ids->clear();
       id = init_inids_round.fetch_add(1);
     }
     during1--;
@@ -1410,18 +1361,18 @@ class KNNG {
     id = build_inids_round.fetch_add(1);
     while (id < M) {
       merge_que_t &que = ques[id];
-      bool added = que.final_sort();
-      if (m_round ==0 && nodes[id].active <= 10 || m_round > 0 && added) {
-        que.sort_set();
+      // que.sort_set();
+      if (m_round ==0 && que.active <= 10) {
+        que.final_sort();
         for (int i=0; i<K; i++) {
           const uint32_t id2 = que.que[i].id;
-          node_t &node = nodes[id2];
-          while(node.inids_lock.test_and_set()) {}
-          node.in_ids->push_back(id);
-          node.inids_lock.clear();
+          merge_que_t &que2 = ques[id2];
+          while(que2.inids_lock.test_and_set()) {}
+          que2.in_ids->push_back(id);
+          que2.inids_lock.clear();
         }
-        que.sort_done();
       }
+      // que.sort_done();
 
       id = build_inids_round.fetch_add(1);
     }
@@ -1479,13 +1430,6 @@ class KNNG {
 
     sum_finished++;
 
-    if (thread_id == 0) {
-      for (uint64_t i=0; i<M; i++) {
-        ques[i].init(i, hashs + i * HASH_SIZE);
-        // ques[i].init(i);
-      }
-    }
-
     while(sum_finished < THREAD) {
       std::this_thread::sleep_for(std::chrono::microseconds(1000));
     }
@@ -1523,13 +1467,6 @@ class KNNG {
 
     while(during1 > 0) {
       std::this_thread::sleep_for(std::chrono::microseconds(1000));
-    }
-
-    if (thread_id == 0) {
-      for (int i=0; i<M; i++) {
-        heaps[i].uninit();
-      }
-      free(heaps);
     }
 
     during2++;
@@ -1609,23 +1546,18 @@ int main(int argc, char* argv[]) {
   locks = (atomic_flag*)malloc(lock_num * sizeof(atomic_flag));
 
   // buf = (dis_id_t*)malloc(M * 2 * (K + QUE_SIZE) * sizeof(dis_id_t));
-  hashs = (uint16_t*)malloc(M * HASH_SIZE * sizeof(uint16_t));
+  // uint16_t *hash = (uint16_t*)malloc(M * HASH_SIZE * sizeof(uint16_t));
   ques = (merge_que_t*)malloc(M * sizeof(merge_que_t));
-  nodes = (node_t*)malloc(M * sizeof(node_t));
   heaps = (heap_t*)malloc(M * sizeof(heap_t));
   seeds = new Seed[MAX_SEED_NUM];
   sqsum = (float*)malloc(M * sizeof(float));
   // in_ids = new vector<uint32_t>[M];
   // out_ids = (uint32_t*)malloc(sizeof(uint32_t) * MAX_OUTLIER_SIZE);
 
-  // for (uint64_t i=0; i<M; i++) {
-  //   // ques[i].init(i);
-  //   ques[i].init(i, hashs + i * HASH_SIZE);
-  //   // ques[i].init(0, i);
-  // }
-
-  for (int i=0; i<M; i++) {
-    nodes[i].init(i);
+  for (uint64_t i=0; i<M; i++) {
+    ques[i].init(i);
+    // ques[i].init(i, hash + i * HASH_SIZE);
+    // ques[i].init(0, i);
   }
 
   for (int i=0; i<M; i++) {
@@ -1703,7 +1635,6 @@ int main(int argc, char* argv[]) {
   free(ids);
   // free(buf);
   free(ques);
-
   for (int i=0; i<THREAD; i++) {
     delete knngs[i];
   }

@@ -35,8 +35,9 @@ using namespace std;
 #define LOCK_STEP 65536
 #define HASH_BUCKET 130
 
-#define HASH_SHIFT 8
-#define HASH_SIZE 512
+
+#define HASH_SHIFT 9
+#define HASH_SIZE (1 << HASH_SHIFT)
 #define HASH_BITMAP 0x1ff
 
 #define QUE_SIZE 50
@@ -51,8 +52,8 @@ using namespace std;
 #define CB_COMBINE_SIZE 4096
 #define OUT_CROSS_SIZE (max(CROSS_SIZE, COMBINE_SIZE))
 
-#define INACTIVE_COMBINE_SUB 7
-#define OUT_COMBINE 110
+#define INACTIVE_COMBINE_SUB 8
+#define OUT_COMBINE 100
 #define MIN_COMBINE 3
 
 #define SEED_INACTIVE_K CROSS_SIZE
@@ -61,7 +62,7 @@ using namespace std;
 #define SEED_INACTIVE_DIS MAX_FLOAT
 
 #define TIME_END 29 * 60 - 20
-#define TIME_LINEAR 5 * 60 + 10
+#define TIME_LINEAR 5 * 60
 
 #define PACK
 #define NO_FREE
@@ -319,7 +320,7 @@ struct merge_que_t {
 
     if (que_size == K) {
       hwm = que[K-1].dis;
-      // replacement.fetch_add(K - i);
+      replacement.fetch_add(K - i);
     }
   }
 
@@ -360,8 +361,7 @@ struct merge_que_t {
 
   inline void insert_batch(const float *dis, const uint32_t *ids, uint32_t size, uint32_t step) {
     // bool hold_lock = false;
-    const uint32_t* const ids_end = ids + size;
-    for (; ids < ids_end; dis+=step, ids++) {
+    for (int i=0; i<size; i++, dis+=step, ids++) {
       if (__builtin_expect(*dis >= hwm, true)) continue;
       if (__builtin_expect(hash_check_and_set(*ids), true)) continue;
       if (__builtin_expect(*ids == m_id, false)) continue;
@@ -719,36 +719,36 @@ inline void run_batch_mm_half(float* distances, const float* v1, const float* v2
   __m512 va[MM_BATCH];
   __m512 vb[MM_BATCH];
 
-  for (int a = 0; a < BATCH && a < sizeA; a += L1_BATCH) {
-    for (int b = 0; b < BATCH && b < sizeB; b += L1_BATCH) {
+  for (a = 0; a < BATCH && a < sizeA; a += L1_BATCH) {
+    for (b = 0; b < BATCH && b < sizeB; b += L1_BATCH) {
 
-      for (int i = a; i < a + L1_BATCH; i += MM_BATCH) {
-        for (int j = b; j < b + L1_BATCH; j += MM_BATCH) {
+      for (i = a; i < a + L1_BATCH; i += MM_BATCH) {
+        for (j = b; j < b + L1_BATCH; j += MM_BATCH) {
 
-          for (int l = 0; l < MM_BATCH * MM_BATCH; l++) {
+          for (l = 0; l < MM_BATCH * MM_BATCH; l++) {
             sum[l] = _mm512_setzero_ps();
           }
 
-          for (int k = 0; k < D; k += 16) {
-            for (int m = 0; m<MM_BATCH; m++) {
+          for (k = 0; k < D; k += 16) {
+            for (m = 0; m<MM_BATCH; m++) {
               va[m] = _mm512_load_ps(v1 + ((i + m) * D) + k);
             }
 
-            for (int n = 0; n<MM_BATCH; n++) {
+            for (n = 0; n<MM_BATCH; n++) {
               vb[n] = _mm512_load_ps(v2 + (j + n) * D + k);
             }
 
 
-            for (int m = 0; m<MM_BATCH; m++) {
-              for (int n = 0; n<MM_BATCH; n++) {
+            for (m = 0; m<MM_BATCH; m++) {
+              for (n = 0; n<MM_BATCH; n++) {
                 sum[m * MM_BATCH + n] = _mm512_fmadd_ps(va[m], vb[n], sum[m * MM_BATCH + n]);
               }
             }
 
           }
 
-          for (int m = 0; m<MM_BATCH; m++) {
-            for (int n = 0; n<MM_BATCH; n++) {
+          for (m = 0; m<MM_BATCH; m++) {
+            for (n = 0; n<MM_BATCH; n++) {
               distances[(i + m) * BATCH + j + n] = sq1[i + m] + sq2[j + n] - _mm512_reduce_add_ps(sum[m * MM_BATCH + n]);
             }
           }
@@ -765,46 +765,46 @@ inline void run_batch_mm_half(float* distances, const float* v1, const float* v2
 }
 
 inline void run_linear_batch_mm_half(float* distances, const float* v1, const float* v2, uint32_t *ids1, uint32_t* ids2) {
-  // int a, b, h, i, j, k, l, m, n;
+  int a, b, h, i, j, k, l, m, n;
   __m512 diff;
   __m512 sum[MM_BATCH * MM_BATCH];
   __m512 va[MM_BATCH];
   __m512 vb[MM_BATCH];
 
   // int64_t start = rdtsc();
-  for (int h = 0; h < LINEAR_SEED_BATCH; h += BATCH) {
+  for (h = 0; h < LINEAR_SEED_BATCH; h += BATCH) {
 
-    for (int a = h; a < h + BATCH; a += L1_BATCH) {
-      for (int b = 0; b < BATCH; b += L1_BATCH) {
+    for (a = h; a < h + BATCH; a += L1_BATCH) {
+      for (b = 0; b < BATCH; b += L1_BATCH) {
 
 
-        for (int i = a; i < a + L1_BATCH; i += MM_BATCH) {
-          for (int j = b; j < b + L1_BATCH; j += MM_BATCH) {
+        for (i = a; i < a + L1_BATCH; i += MM_BATCH) {
+          for (j = b; j < b + L1_BATCH; j += MM_BATCH) {
 
-            for (int l = 0; l < MM_BATCH * MM_BATCH; l++) {
+            for (l = 0; l < MM_BATCH * MM_BATCH; l++) {
               sum[l] = _mm512_setzero_ps();
             }
 
-            for (int k = 0; k < D; k += 16) {
-              for (int m = 0; m<MM_BATCH; m++) {
+            for (k = 0; k < D; k += 16) {
+              for (m = 0; m<MM_BATCH; m++) {
                 va[m] = _mm512_load_ps(v1 + ((i + m) * D) + k);
               }
 
-              for (int n = 0; n<MM_BATCH; n++) {
+              for (n = 0; n<MM_BATCH; n++) {
                 vb[n] = _mm512_load_ps(v2 + (j + n) * D + k);
               }
 
 
-              for (int m = 0; m<MM_BATCH; m++) {
-                for (int n = 0; n<MM_BATCH; n++) {
+              for (m = 0; m<MM_BATCH; m++) {
+                for (n = 0; n<MM_BATCH; n++) {
                   sum[m * MM_BATCH + n] = _mm512_fmadd_ps(va[m], vb[n], sum[m * MM_BATCH + n]);
                 }
               }
 
             }
 
-            for (int m = 0; m<MM_BATCH; m++) {
-              for (int n = 0; n<MM_BATCH; n++) {
+            for (m = 0; m<MM_BATCH; m++) {
+              for (n = 0; n<MM_BATCH; n++) {
                 distances[(i + m) * BATCH + j + n] = sqsum[ids1[i + m]] + sqsum[ids2[j + n]] - _mm512_reduce_add_ps(sum[m * MM_BATCH + n]);
               }
             }
